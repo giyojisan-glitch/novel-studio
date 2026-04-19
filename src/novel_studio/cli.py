@@ -9,6 +9,7 @@ from rich.table import Table
 from .state import NovelState, UserInput
 from .utils import make_project_dir, save_state, load_state, queue_pending, resolve_input_file, INPUTS_ROOT, export_artifacts, ARTIFACTS_ROOT
 from .engine import advance
+from .slop_check import scan as slop_scan
 
 
 console = Console()
@@ -85,6 +86,49 @@ def cmd_artifacts(args):
         console.print(f"  • {f.name}  [dim]({size_kb:.1f} KB)[/]")
 
 
+def cmd_slop(args):
+    """机械 slop 扫描：不调 LLM，仅用词表+正则。"""
+    path = Path(args.file)
+    if not path.exists():
+        console.print(f"[red]✗[/] 文件不存在：{path}")
+        sys.exit(1)
+    text = path.read_text(encoding="utf-8")
+    report = slop_scan(text)
+
+    # 分数彩色显示
+    if report.score < 2.0:
+        color = "green"
+        verdict = "✓ 干净"
+    elif report.score < 4.0:
+        color = "yellow"
+        verdict = "⚠ 轻度 AI 味"
+    elif report.score < 6.5:
+        color = "bright_yellow"
+        verdict = "⚠ 中度 AI 味"
+    else:
+        color = "red"
+        verdict = "✗ 重度 AI 味"
+
+    console.print(f"\n[bold {color}]Slop Score: {report.score:.2f} / 10.0   {verdict}[/]")
+    console.print(f"[dim]  {path.name} · {report.stats['chinese_chars']} 中文字 · "
+                  f"{report.stats['paragraphs']} 段 · {report.stats['sentences']} 句[/]\n")
+
+    if not report.hits:
+        console.print("[green]没有命中任何规则。[/]")
+        return
+
+    if args.verbose:
+        console.print(report.detailed())
+    else:
+        # 简略：Top 10 扣分
+        top = report.hits[:10]
+        console.print(f"[bold]Top {len(top)} 命中：[/]")
+        for h in top:
+            console.print(f"  [yellow]•[/] {h}")
+        if len(report.hits) > 10:
+            console.print(f"  [dim]... 还有 {len(report.hits) - 10} 条。加 --verbose 看全部[/]")
+
+
 def _print_status(state: NovelState, pdir: Path, result: dict):
     status = result.get("status")
     next_step = result.get("next_step", state.next_step)
@@ -155,6 +199,11 @@ def main():
     p_art = sub.add_parser("artifacts", help="回填 artifacts/ 中间产物（已有项目也能用）")
     p_art.add_argument("project_dir")
     p_art.set_defaults(func=cmd_artifacts)
+
+    p_slop = sub.add_parser("slop", help="机械 slop 检测（不调 LLM，仅词表+正则）")
+    p_slop.add_argument("file", help="要扫描的 markdown / 文本文件")
+    p_slop.add_argument("-v", "--verbose", action="store_true", help="显示所有命中（默认只 Top 10）")
+    p_slop.set_defaults(func=cmd_slop)
 
     args = parser.parse_args()
     try:

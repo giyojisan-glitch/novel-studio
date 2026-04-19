@@ -42,7 +42,53 @@ def export_artifacts(state: NovelState, pdir: Path) -> Path:
         (adir / "03_L3_正文草稿.md").write_text(_render_l3(state), encoding="utf-8")
     if state.audit_history:
         (adir / "04_audit_历程.md").write_text(_render_audits(state), encoding="utf-8")
+    if state.l3:
+        (adir / "05_slop_report.md").write_text(_render_slop(state), encoding="utf-8")
     return adir
+
+
+def _render_slop(state: NovelState) -> str:
+    """逐章跑 slop 扫描并合并成一份报告。feed-forward 模式：只报告不阻塞。"""
+    from .slop_check import scan
+
+    L = ["# Slop Report（机械检测 · 不调 LLM）\n"]
+    L.append("> 灵感来自 autonovel/ANTI-SLOP.md，完全中文化。")
+    L.append("> 0-2 干净，2-4 轻度 AI 味，4-6.5 中度，6.5+ 重度。\n")
+    L.append("## 分章节扫描\n")
+
+    all_scores = []
+    for d in sorted(state.l3, key=lambda x: x.index):
+        l2 = next((c for c in state.l2 if c.index == d.index), None)
+        title = l2.title if l2 else f"第 {d.index} 章"
+        report = scan(d.content)
+        all_scores.append(report.score)
+        verdict = (
+            "✓ 干净" if report.score < 2.0
+            else "⚠ 轻度" if report.score < 4.0
+            else "⚠ 中度" if report.score < 6.5
+            else "✗ 重度"
+        )
+        L.append(f"### 第 {d.index} 章 · {title}  —  **{report.score:.2f} / 10  {verdict}**")
+        L.append(f"*{report.stats['chinese_chars']} 字 · {report.stats['paragraphs']} 段 · "
+                 f"{report.stats['sentences']} 句*\n")
+        if not report.hits:
+            L.append("（无命中）\n")
+        else:
+            top = report.hits[:8]
+            L.append("Top 命中：")
+            for h in top:
+                L.append(f"- **[{h.category}]** {h.detail}" +
+                         (f" ×{h.count}" if h.count > 1 else "") +
+                         f"  *(+{h.points:.1f})*")
+            if len(report.hits) > 8:
+                L.append(f"- *（还有 {len(report.hits) - 8} 条）*")
+            L.append("")
+        L.append("---\n")
+
+    if all_scores:
+        avg = sum(all_scores) / len(all_scores)
+        L.insert(3, f"**全书平均 Slop Score: {avg:.2f} / 10.0**\n")
+    return "\n".join(L)
 
 
 def _render_l1(state: NovelState) -> str:
