@@ -26,19 +26,23 @@ These are the minimum additions to make the system *useful to someone who isn't 
 
 ### V2.1 — API-based LLM provider
 
-**Goal:** replace `HumanQueue` with a provider that calls a real API.
+**Status:** ✅ `AnthropicProvider` shipped. `OpenAIProvider` / `OllamaProvider` still open.
 
-**Scope:**
-- `AnthropicProvider` — calls Claude API, handles schema validation, retries on malformed JSON, structured output via `response_format`
-- `OpenAIProvider` — same, for GPT-4 family
-- (Optional) `OllamaProvider` for local models
+**Shipped:**
+- `AnthropicProvider` calls Claude API via official SDK
+- 2-tier retry: API errors (exponential backoff × 3), malformed JSON (with prompt hint, × 2)
+- Markdown code-fence stripping
+- Output-compatible with HumanQueue (writes to `responses/`) — resuming works cleanly
+- Mock-based test coverage (13 tests)
+- Env-var config: `ANTHROPIC_API_KEY`, `NOVEL_STUDIO_MODEL`, `NOVEL_STUDIO_MAX_TOKENS`
 
-**Hard parts:**
-- LLMs sometimes return truncated JSON. Need robust parsing with fallback to prompt-repair ("your previous response had an error: X; please regenerate").
-- Schema violations need explicit retries, not silent pass-through.
-- Rate limiting, cost tracking, graceful degradation.
+**Still open for contributors:**
+- `OpenAIProvider` — GPT-4 family. Copy AnthropicProvider pattern; differences mostly in client SDK surface.
+- `OllamaProvider` — local models. Useful for testing without API cost.
+- Schema-validation-driven retries (currently retries on JSON syntax only; Pydantic validation errors still bubble to engine layer). Could add a third retry tier that catches `ValidationError` and re-prompts with "fields missing: X, Y".
+- Rate limiting / cost budgeting — currently unbounded; a `max_cost_usd` kill-switch would help production use.
 
-**Estimated effort:** 200–400 LoC per provider.
+**Estimated remaining effort:** ~150 LoC per new provider.
 
 ### V2.2 — Final-stage audit
 

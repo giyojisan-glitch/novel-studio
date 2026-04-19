@@ -7,13 +7,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
 class ProviderResult:
-    """Provider 的响应结果。"""
-    ready: bool                 # 响应是否已经可用
-    data: dict | None = None    # 如果 ready=True，这里是解析后的 JSON 响应
+    """Provider 的响应结果。
+
+    data 类型：
+    - 大部分 step 返回 dict（对应单个 Pydantic 模型）
+    - L4_adversarial_N 返回 list（对应 list[AdversarialCut]）
+    """
+    ready: bool
+    data: Any = None            # dict / list / None
     error: str | None = None    # 解析/获取失败的原因（ready=True 但有 error 说明拿到东西但不合法）
 
 

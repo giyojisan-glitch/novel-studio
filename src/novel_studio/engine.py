@@ -33,6 +33,7 @@ from .state import (
 )
 from . import prompts as P
 from .audit import aggregate, should_force_pass, MAX_REVISION
+from .llm import BaseProvider, HumanQueueProvider
 from .utils import (
     write_prompt,
     read_response,
@@ -42,6 +43,11 @@ from .utils import (
     export_artifacts,
 )
 from .slop_check import scan as slop_scan
+
+
+# Default provider used by advance() when caller doesn't inject one.
+# Kept as HumanQueue for backward compat.
+DEFAULT_PROVIDER: BaseProvider = HumanQueueProvider()
 
 
 # ====== expected prompts mapping ======
@@ -105,11 +111,21 @@ def _compute_slop_avg(state: NovelState) -> float:
 # ====== 应用响应 ======
 
 
-def apply_responses(state: NovelState, step_ids: list[str], pdir: Path) -> None:
+def apply_responses(
+    state: NovelState,
+    step_ids: list[str],
+    pdir: Path,
+    provider: BaseProvider | None = None,
+) -> None:
     """把响应 JSON 解析并写入 state 对应字段。"""
+    provider = provider or DEFAULT_PROVIDER
+
+    def _fetch(sid: str):
+        return provider.query(sid, pdir).data
+
     if len(step_ids) == 1:
         sid = step_ids[0]
-        data = read_response(pdir, sid)
+        data = _fetch(sid)
         if sid == "L1":
             state.l1 = L1Skeleton(**data)
         elif sid.startswith("L2_"):
@@ -122,7 +138,6 @@ def apply_responses(state: NovelState, step_ids: list[str], pdir: Path) -> None:
             state.final_verdict = FinalVerdict(**data)
         elif sid.startswith("L4_adversarial_"):
             idx = int(sid.split("_")[2])
-            # data 预期是一个 list（AdversarialCut 数组）
             cuts = [AdversarialCut(**c) for c in (data if isinstance(data, list) else [])]
             _upsert_l4_cuts(state, idx, cuts)
         elif sid.startswith("L4_scrubber_"):
@@ -132,7 +147,7 @@ def apply_responses(state: NovelState, step_ids: list[str], pdir: Path) -> None:
             _upsert_l4_polished(state, polished)
     else:
         # audit 一组：2 头 → 聚合
-        reports = [AuditReport(**read_response(pdir, sid)) for sid in step_ids]
+        reports = [AuditReport(**_fetch(sid)) for sid in step_ids]
         layer, idx = _parse_audit_target(step_ids[0])
         verdict = aggregate(layer, idx, reports)
         state.audit_history.append(verdict)
@@ -306,8 +321,18 @@ def reset_step_files(pdir: Path, step_ids: list[str]) -> None:
 # ====== 主 advance ======
 
 
-def advance(state: NovelState, pdir: Path) -> dict:
-    """单步推进。返回状态字典：{status, step_ids, next_step, ...}"""
+def advance(
+    state: NovelState,
+    pdir: Path,
+    provider: BaseProvider | None = None,
+) -> dict:
+    """单步推进。返回状态字典：{status, step_ids, next_step, ...}
+
+    provider: LLM provider 抽象。默认 HumanQueueProvider（文件驱动，需要人响应）。
+              传入 StubProvider 可跑 smoke test；传入 AnthropicProvider 全自动。
+    """
+    provider = provider or DEFAULT_PROVIDER
+
     if state.next_step == "finalize":
         return _do_finalize(state, pdir)
 
@@ -316,23 +341,34 @@ def advance(state: NovelState, pdir: Path) -> dict:
 
     expected = expected_prompts(state.next_step)
 
-    # 1) 是否需要 dump prompt
-    missing_prompts = [
-        sid for sid in expected if not (pdir / "queue" / f"{sid}.prompt.md").exists()
-    ]
-    if missing_prompts:
-        for sid in missing_prompts:
+    # 1) 发起还没 request 过的 step（对 Anthropic 会真调 API）
+    dispatched = []
+    for sid in expected:
+        result = provider.query(sid, pdir)
+        if not result.ready and not _request_already_made(provider, sid, pdir):
             text = build_prompt(state, sid)
-            write_prompt(pdir, sid, text)
+            provider.request(sid, text, pdir)
+            dispatched.append(sid)
+
+    if dispatched:
         save_state(pdir, state)
-        return {
-            "status": "dumped",
-            "step_ids": missing_prompts,
-            "next_step": state.next_step,
-        }
+        # 对 Human provider：dispatched 表示 "prompt 已 dump，等人响应"
+        # 对 Anthropic/Stub：已经拿到响应了（同步），继续往下走到 step 2
+        # 所以 re-query 看看
+        still_pending = [
+            sid for sid in expected
+            if not provider.query(sid, pdir).ready
+        ]
+        if still_pending:
+            return {
+                "status": "dumped",
+                "step_ids": still_pending,
+                "next_step": state.next_step,
+            }
 
     # 2) 是否所有响应到齐
-    missing_resp = [sid for sid in expected if read_response(pdir, sid) is None]
+    results = {sid: provider.query(sid, pdir) for sid in expected}
+    missing_resp = [sid for sid, r in results.items() if not r.ready]
     if missing_resp:
         return {
             "status": "waiting",
@@ -341,7 +377,7 @@ def advance(state: NovelState, pdir: Path) -> dict:
         }
 
     # 3) 全到齐 → apply、决定下一步
-    apply_responses(state, expected, pdir)
+    apply_responses(state, expected, pdir, provider=provider)
     state.trace.append({"step": state.next_step, "applied": expected})
     export_artifacts(state, pdir)
     new_next = decide_next(state)
@@ -353,19 +389,30 @@ def advance(state: NovelState, pdir: Path) -> dict:
     state.next_step = new_next
     save_state(pdir, state)
 
-    # 立即 dump 下一步的 prompt（如果不是终态）
+    # 立即 dispatch 下一步（如果不是终态）
     if new_next not in ("finalize", "DONE"):
         next_expected = expected_prompts(new_next)
         for sid in next_expected:
-            if not (pdir / "queue" / f"{sid}.prompt.md").exists():
+            result = provider.query(sid, pdir)
+            if not result.ready:
                 text = build_prompt(state, sid)
-                write_prompt(pdir, sid, text)
+                provider.request(sid, text, pdir)
+        # 同步 provider 会直接准备好 → 下次 advance 会处理；异步则返回 "advanced"
         return {"status": "advanced", "step_ids": next_expected, "next_step": new_next}
 
     if new_next == "finalize":
-        return advance(state, pdir)
+        return advance(state, pdir, provider=provider)
 
     return {"status": "advanced", "step_ids": [], "next_step": new_next}
+
+
+def _request_already_made(provider: BaseProvider, step_id: str, pdir: Path) -> bool:
+    """判定是否已经给这个 step 发过请求（避免重复 dispatch）。
+
+    HumanQueue/Anthropic：看 queue/{sid}.prompt.md 是否存在
+    Stub：看内部 cache（但 Stub 的 query() 在 request 后就 ready=True，不会走到这里）
+    """
+    return (pdir / "queue" / f"{step_id}.prompt.md").exists()
 
 
 def _do_finalize(state: NovelState, pdir: Path) -> dict:

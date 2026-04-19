@@ -9,6 +9,7 @@ dependencies = [
     "pydantic>=2.9",
     "rich>=13.0",
     "python-slugify>=8.0",
+    "anthropic>=0.96.0",
 ]
 
 [project.optional-dependencies]

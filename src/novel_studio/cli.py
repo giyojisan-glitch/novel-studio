@@ -10,6 +10,7 @@ from .state import NovelState, UserInput
 from .utils import make_project_dir, save_state, load_state, queue_pending, resolve_input_file, INPUTS_ROOT, export_artifacts, ARTIFACTS_ROOT
 from .engine import advance
 from .slop_check import scan as slop_scan
+from .llm import get_provider
 
 
 console = Console()
@@ -49,8 +50,9 @@ def cmd_init(args):
     )
     save_state(pdir, state)
 
-    # 立即 dump L1 的 prompt
-    result = advance(state, pdir)
+    # 立即 dispatch L1
+    provider = get_provider(args.provider)
+    result = advance(state, pdir, provider=provider)
 
     console.print(Panel.fit(
         f"[bold cyan]NOVEL-Studio[/] 项目已创建\n\n"
@@ -66,7 +68,8 @@ def cmd_init(args):
 def cmd_step(args):
     pdir = Path(args.project_dir)
     state = load_state(pdir)
-    result = advance(state, pdir)
+    provider = get_provider(args.provider)
+    result = advance(state, pdir, provider=provider)
     _print_status(state, pdir, result)
 
 
@@ -189,10 +192,14 @@ def main():
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
     p_init.add_argument("--v2", action="store_true",
                         help="启用 V2 pipeline（final_audit + L4 adversarial + L4 scrubber）")
+    p_init.add_argument("--provider", default=None,
+                        help="LLM provider: human_queue (默认) / anthropic / stub")
     p_init.set_defaults(func=cmd_init)
 
     p_step = sub.add_parser("step", help="读响应、推进到下一步")
     p_step.add_argument("project_dir")
+    p_step.add_argument("--provider", default=None,
+                        help="LLM provider: human_queue (默认) / anthropic / stub")
     p_step.set_defaults(func=cmd_step)
 
     p_status = sub.add_parser("status", help="查看当前项目进度")

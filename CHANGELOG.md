@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **V2.1 Autonomous AnthropicProvider** — real Claude API calls, no Claude Code session required
+  - 2-tier retry: API errors (exponential backoff × 3) + malformed JSON (with hint, × 2)
+  - Markdown code fence stripping (handles LLM responses wrapped in ```json)
+  - Output-compatible with HumanQueue — writes to `responses/{step_id}.response.json`
+    so resuming interrupted runs just works
+  - Lazy client init — importing doesn't require API key, only actual use does
+  - Env vars: `ANTHROPIC_API_KEY`, `NOVEL_STUDIO_MODEL`, `NOVEL_STUDIO_MAX_TOKENS`
+- **Engine wired through provider abstraction** — `advance(state, pdir, provider=...)`
+  - Default stays `HumanQueueProvider` for backward compat
+  - CLI gains `--provider {human_queue|stub|anthropic}` flag on `init`/`step`
+- **End-to-end smoke tests** (`tests/test_engine.py`) — V1 and V2 pipelines both verified
+  to run start-to-DONE under `StubProvider`, no LLM calls
+- `anthropic` SDK as a runtime dependency
+
+### Added
 - **V2 pipeline scaffolding** (opt-in via `--v2` flag on `init`):
   - `FinalVerdict` schema — whole-book audit against premise
   - Final-stage audit step that catches cross-layer bugs (timeline, foreshadow, character collapse)
