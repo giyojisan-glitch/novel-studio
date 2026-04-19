@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets / env
+.env
+.env.local
+*.key
+*.pem
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# User runtime data (not for publishing)
+projects/
+outputs/
+artifacts/
+
+# User inputs (keep only templates and examples)
+inputs/*
+!inputs/_TEMPLATE.md
+!inputs/_EXAMPLE_*.md
+!inputs/.gitkeep
+
+# Local Claude Code memory / plans
+.claude/
