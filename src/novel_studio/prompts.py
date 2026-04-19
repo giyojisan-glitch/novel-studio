@@ -5,7 +5,15 @@ prompt 文件会写到 projects/{slug}/queue/{step_id}.prompt.md，
 """
 from __future__ import annotations
 import json
-from .state import NovelState, L1Skeleton, L2ChapterOutline, L3ChapterDraft
+from .state import (
+    NovelState,
+    L1Skeleton,
+    L2ChapterOutline,
+    L3ChapterDraft,
+    L4PolishedChapter,
+    FinalVerdict,
+    AdversarialCut,
+)
 
 
 # ============ L1 骨架 ============
@@ -312,3 +320,234 @@ def _current_revision(state: NovelState, step_key: str) -> int:
         draft = next((d for d in state.l3 if d.index == idx), None)
         return draft.revision if draft else 0
     return 0
+
+
+# ============ V2: Final-stage Audit ============
+FINAL_AUDIT_SYSTEM = """你是小说质检总编。你不管单层对不对，只管**这本小说能不能用**。
+
+你的职责是抓跨层 bug：
+- 时间线矛盾：章节里的日期/年龄/时段前后不一致
+- 伏笔漏掉：前面铺垫了但没兑现
+- 配角坍塌：L1 骨架里重要的角色在 L3 完全消失
+- 主题跑偏：成品的主题和 premise 承诺的明显偏离
+- 世界规则违反：L1 定的 world_rules 被后续违反
+
+别管单句美不美、有没有 slop（那有单独的 audit 头）。**只判"能给人看吗"**。
+
+你要诚实：系统已经给每层打过分，但那些分不是你的依据。你的依据只有两样——**原始 premise** 和**成品全文**。"""
+
+FINAL_AUDIT_TASK = """## 任务
+做成品审。对照 premise 原文，通读整本书，判断是否"可用"。
+
+## 原始 Premise（用户原始输入）
+{premise}
+
+## Genre：{genre}   目标长度：{total_target} 字
+
+## 完整成品（L3 全文拼接）
+{full_markdown}
+
+## 机械检查附加
+- 各章平均 slop 分：{slop_avg:.2f} / 10.0
+{slop_hint}
+
+## 必须检查
+1. **时间线一致性**：成品里出现的任何日期/年龄/时段，彼此自洽吗？和 premise 说的对得上吗？
+2. **伏笔闭合**：第 1 章铺垫的元素（人物、物件、承诺、威胁）后续是否兑现？
+3. **角色兑现**：premise 提到的所有角色是否在成品里至少出现一次？戏份是否匹配 premise 设定的权重？
+4. **世界规则**：L1 定的 world_rules 是否被剧情违反？
+5. **主题兑现**：premise 承诺的主题冲突（外在 want vs 内在 need）是否真被展开？
+
+## 判定标准
+- `usable=true` 要求：上述 5 项没有**硬伤级**问题（小瑕疵不算）。硬伤 = 读者一读就迷惑/破戏。
+- `usable=false`：至少 1 项硬伤存在。必须写清楚具体症状。
+
+## 打回定位
+如果 usable=false，推断问题源自：
+- `premise`：原始输入就有矛盾/不完整（用户要修 premise）
+- `L1`：骨架里的规则/角色/三幕已经错了（退回 L1 重写）
+- `L2`：章节梗概割裂或漏接（退回 L2）
+- `L3`：梗概对但执行偏（退回 L3）
+- `L4`：润色改坏了（退回 L4）
+
+## 输出
+严格 JSON：
+
+```json
+{schema}
+```
+
+- `overall_score` 0.0-1.0（≥0.7 可用）
+- `symptoms` 具体问题（每条 ≤30 字），如果可用则为空
+- `suspect_layer` 从 premise/L1/L2/L3/L4/none 选
+- `retry_hint` 打回时给那层的定向反馈（具体到"第 X 章的 Y 问题"，不要空话）
+- `slop_avg` 填 {slop_avg:.2f}
+"""
+
+
+def final_audit_prompt(state: NovelState, full_markdown: str, slop_avg: float) -> str:
+    ui = state.user_input
+    total_target = ui.chapter_count * ui.target_words_per_chapter
+    slop_hint = (
+        "（所有章节都在干净区间，词汇层无明显 AI 味）"
+        if slop_avg < 2.0
+        else f"（平均 {slop_avg:.2f}，偏向轻度 AI 味，但结构问题优先）"
+        if slop_avg < 4.0
+        else f"（平均 {slop_avg:.2f}，slop 已偏高，考虑让 L4 彻底清洗）"
+    )
+    return FINAL_AUDIT_SYSTEM + "\n\n" + FINAL_AUDIT_TASK.format(
+        premise=ui.premise,
+        genre=ui.genre,
+        total_target=total_target,
+        full_markdown=full_markdown,
+        slop_avg=slop_avg,
+        slop_hint=slop_hint,
+        schema=schema_of(FinalVerdict),
+    )
+
+
+# ============ V2: L4 Adversarial Edit ============
+ADVERSARIAL_EDIT_SYSTEM = """你是狠心的删稿编辑。你的任务**不是润色**，是**暴露弱点**。
+
+灵感来自 autonovel/adversarial_edit.py：最弱的内容是**什么会被最先切掉**。
+
+你的工具只有一个：从这一章里砍 {cut_target} 字。砍完之后章节逻辑要依然成立。
+
+砍掉的每一段都要归类：
+- **FAT**：可有可无的形容词、修饰词、无意义的节奏补丁
+- **REDUNDANT**：和前文/本段已表达过的内容重复
+- **OVER_EXPLAIN**：旁白解释了场景本来已经演出来的东西（show vs tell 违反）
+- **GENERIC**：没有本篇特色、换个作品也能用的通用句子
+- **TELL**：直接告诉读者情绪/事实，而没用动作/物件/对白带出来
+- **STRUCTURAL**：结构性赘笔（段落落点偏、转场生硬、无效过场）
+
+你必须诚实：如果一章真的没废话，你也可以砍到上限以下，但必须给出至少 3 条切割以证明你在认真读。"""
+
+ADVERSARIAL_EDIT_TASK = """## 任务
+对本章执行对抗编辑：砍 {cut_target} 字。
+
+## 章节信息
+- 第 {chapter_idx} / {total_chapters} 章 · 《{chapter_title}》
+- 当前字数：{current_words}
+- 目标砍掉：{cut_target} 字（≈ {cut_percent}%）
+
+## L1 骨架（参考）
+- 主角 want：{protagonist_want}
+- 主角 need：{protagonist_need}
+
+## 本章 L2 梗概（章节目标）
+{l2_summary}
+
+## L3 原文
+```
+{l3_content}
+```
+
+## 输出
+严格 JSON——一个 AdversarialCut 列表：
+
+```json
+{schema}
+```
+
+每条 `AdversarialCut`：
+- `category` 从 FAT / REDUNDANT / OVER_EXPLAIN / GENERIC / TELL / STRUCTURAL 选
+- `quoted_text` 是原文里**一字不差**的片段（用来后续定位删除），≤ 80 字
+- `reason` ≤ 30 字，说清为什么砍
+
+输出一个 JSON 数组，至少 3 条。不要 markdown 包裹。
+"""
+
+
+def adversarial_edit_prompt(state: NovelState, chapter_idx: int, cut_target: int) -> str:
+    l3 = next(d for d in state.l3 if d.index == chapter_idx)
+    l2 = next(c for c in state.l2 if c.index == chapter_idx)
+    cut_percent = int(100 * cut_target / max(l3.word_count, 1))
+    return ADVERSARIAL_EDIT_SYSTEM.format(cut_target=cut_target) + "\n\n" + ADVERSARIAL_EDIT_TASK.format(
+        cut_target=cut_target,
+        chapter_idx=chapter_idx,
+        total_chapters=state.user_input.chapter_count,
+        chapter_title=l2.title,
+        current_words=l3.word_count,
+        cut_percent=cut_percent,
+        protagonist_want=state.l1.protagonist.want,
+        protagonist_need=state.l1.protagonist.need,
+        l2_summary=l2.summary,
+        l3_content=l3.content,
+        schema=json.dumps([AdversarialCut.model_json_schema()], ensure_ascii=False, indent=2),
+    )
+
+
+# ============ V2: L4 Scrubber ============
+SCRUBBER_SYSTEM = """你是出版级清理编辑（灵感来自 AIStoryWriter/Writer/Scrubber.py）。
+
+把一份 L3 原稿 + 对抗编辑切割清单 → 出版级成品。
+
+清理三件事：
+1. **应用对抗编辑建议**：把清单里每个 `quoted_text` 所在的原文片段删/改——具体怎么处理看你判断（删除 / 改写更紧 / 融合进邻段）
+2. **去 AI 味**：扫全文，凡是 `styles/_anti_slop.md` 里定义的烂俗词/固定搭配/填充短语，全部改掉
+3. **保持本章主旨**：不要删关键情节点，尤其是 `key_events` 和 `hook`
+
+不做：
+- 不改变情节走向
+- 不新增设定
+- 不润色到作者本人都认不出
+
+输出**完整重写后的章节正文**，不是 diff。"""
+
+SCRUBBER_TASK = """## 任务
+清洗第 {chapter_idx} / {total_chapters} 章《{chapter_title}》。
+
+## 原稿（L3）
+```
+{l3_content}
+```
+
+## 对抗编辑建议（需要应用）
+{cuts_formatted}
+
+## 本章核心剧情点（不能删）
+Key events:
+{key_events}
+Hook: {hook}
+
+## 输出
+严格 JSON：
+
+```json
+{schema}
+```
+
+- `content` 是完整重写后的正文（可以有换行，用 `\\n` 表示）
+- `adversarial_cuts` 照抄输入里那份清单（不要重新生成，不要改动）
+- `polish_notes` 列出 3-8 条你做过的修改（每条 ≤ 30 字，如"删除第 2 段的'仿佛时间静止'"）
+- `index` 是 {chapter_idx}
+- `revision` 是 {revision}
+"""
+
+
+def scrubber_prompt(state: NovelState, chapter_idx: int) -> str:
+    l3 = next(d for d in state.l3 if d.index == chapter_idx)
+    l2 = next(c for c in state.l2 if c.index == chapter_idx)
+    # 找到当前章节的 L4（如果已经有对抗编辑结果）
+    l4 = next((p for p in state.l4 if p.index == chapter_idx), None)
+    cuts = l4.adversarial_cuts if l4 else []
+    if cuts:
+        cuts_formatted = "\n".join(
+            f"{i}. [{c.category}] 『{c.quoted_text}』 — {c.reason}"
+            for i, c in enumerate(cuts, 1)
+        )
+    else:
+        cuts_formatted = "（本章没有对抗编辑切割建议，只做 slop 清理即可）"
+    key_events = "\n".join(f"- {e}" for e in l2.key_events)
+    return SCRUBBER_SYSTEM + "\n\n" + SCRUBBER_TASK.format(
+        chapter_idx=chapter_idx,
+        total_chapters=state.user_input.chapter_count,
+        chapter_title=l2.title,
+        l3_content=l3.content,
+        cuts_formatted=cuts_formatted,
+        key_events=key_events,
+        hook=l2.hook,
+        schema=schema_of(L4PolishedChapter),
+        revision=l4.revision if l4 else 0,
+    )

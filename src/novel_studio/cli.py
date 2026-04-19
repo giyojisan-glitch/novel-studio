@@ -44,6 +44,7 @@ def cmd_init(args):
             genre=args.genre,
             chapter_count=args.chapters,
             target_words_per_chapter=args.words,
+            pipeline_version="v2" if args.v2 else "v1",
         )
     )
     save_state(pdir, state)
@@ -186,6 +187,8 @@ def main():
     p_init.add_argument("--chapters", type=int, default=3)
     p_init.add_argument("--words", type=int, default=1000)
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
+    p_init.add_argument("--v2", action="store_true",
+                        help="启用 V2 pipeline（final_audit + L4 adversarial + L4 scrubber）")
     p_init.set_defaults(func=cmd_init)
 
     p_step = sub.add_parser("step", help="读响应、推进到下一步")

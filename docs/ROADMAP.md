@@ -20,6 +20,8 @@ Priority-ordered list of what's missing and what it would take to build.
 
 ## V2 — Autonomy & better review (highest priority)
 
+**Status (2026-04-19):** V2 **architecture scaffolding is complete**. Schema, engine routing, prompts, provider abstraction, and tests are in. What remains is turning skeletons into real implementations (notably `AnthropicProvider.request()` which currently raises `NotImplementedError`). Opt-in via `uv run novel-studio init ... --v2`.
+
 These are the minimum additions to make the system *useful to someone who isn't the author*.
 
 ### V2.1 — API-based LLM provider
