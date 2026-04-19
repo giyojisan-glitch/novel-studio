@@ -39,3 +39,9 @@ class HumanQueueProvider(BaseProvider):
             p = pdir / sub / f"{step_id}{suffix}"
             if p.exists():
                 p.unlink()
+
+    def has_pending_request(self, step_id: str, pdir: Path) -> bool:
+        """HumanQueue: prompt 已 dump 但 response 还没写 = 等人响应。"""
+        prompt_exists = (pdir / "queue" / f"{step_id}.prompt.md").exists()
+        response_exists = (pdir / "responses" / f"{step_id}.response.json").exists()
+        return prompt_exists and not response_exists

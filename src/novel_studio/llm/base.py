@@ -50,3 +50,11 @@ class BaseProvider(ABC):
     def reset(self, step_id: str, pdir: Path) -> None:
         """重写时清理旧数据（prompt + response）。默认空实现。"""
         return None
+
+    def has_pending_request(self, step_id: str, pdir: Path) -> bool:
+        """是否已发起请求但还没拿到响应。
+
+        - 同步 provider（Anthropic / Stub）：request() 完成即响应就绪 → 永远返回 False
+        - 异步 provider（HumanQueue）：prompt 已 dump 但 response 还没写 → 返回 True
+        """
+        return False

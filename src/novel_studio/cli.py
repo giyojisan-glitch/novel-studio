@@ -146,16 +146,20 @@ def cmd_benchmark_batch(args):
         console.print("[red]✗[/] benchmark 需要 ANTHROPIC_API_KEY。")
         sys.exit(1)
 
-    files = sorted(f for f in corpus.glob("*.md") if not f.name.startswith(("_", ".")))
+    from .benchmark.runner import _collect_source_files
+    files = _collect_source_files(corpus, recursive=not args.no_recursive)
+    if args.limit is not None:
+        files = files[:args.limit]
     if not files:
-        console.print(f"[yellow]⚠[/] {corpus}/ 下没有 .md 文件（忽略 _开头的模板）")
+        console.print(f"[yellow]⚠[/] {corpus}/ 下没有 .md / .txt 文件")
         sys.exit(0)
 
-    console.print(f"[cyan]→[/] 批量跑 [bold]{len(files)}[/] 个案例\n")
+    console.print(f"[cyan]→[/] 批量跑 [bold]{len(files)}[/] 个案例（recursive={not args.no_recursive}）\n")
 
     results = bench_run_batch(
         corpus, provider=provider,
         pipeline_version=args.pipeline, genre=args.genre,
+        recursive=not args.no_recursive, limit=args.limit,
     )
 
     if not results:
@@ -318,11 +322,16 @@ def main():
     p_bone.set_defaults(func=cmd_benchmark_one)
 
     p_ball = sub.add_parser("benchmark",
-                             help="批量跑 corpus/ 下所有短篇")
-    p_ball.add_argument("corpus_dir", help="放 .md 原文的目录（如 benchmarks/corpus）")
-    p_ball.add_argument("--genre", default="科幻",
-                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠"])
+                             help="批量跑 corpus/ 下所有短篇（支持 .md/.txt 递归 + 自动 genre 推断）")
+    p_ball.add_argument("corpus_dir", help="放原文的目录（如 benchmarks/corpus）")
+    p_ball.add_argument("--genre", default=None,
+                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠"],
+                        help="指定 genre（默认按子目录自动推断）")
     p_ball.add_argument("--pipeline", default="v1", choices=["v1", "v2"])
+    p_ball.add_argument("--limit", type=int, default=None,
+                        help="只跑前 N 篇（试水用）")
+    p_ball.add_argument("--no-recursive", action="store_true",
+                        help="只扫 corpus_dir 顶层，不进子目录")
     p_ball.set_defaults(func=cmd_benchmark_batch)
 
     args = parser.parse_args()

@@ -127,22 +127,27 @@ def apply_responses(
         sid = step_ids[0]
         data = _fetch(sid)
         if sid == "L1":
-            state.l1 = L1Skeleton(**data)
+            state.l1 = L1Skeleton(**_coerce_dict(data, expected_index=None))
         elif sid.startswith("L2_"):
-            outline = L2ChapterOutline(**data)
+            idx = int(sid.split("_")[1])
+            outline = L2ChapterOutline(**_coerce_dict(data, expected_index=idx))
             _upsert_l2(state, outline)
         elif sid.startswith("L3_"):
-            draft = L3ChapterDraft(**data)
+            idx = int(sid.split("_")[1])
+            draft = L3ChapterDraft(**_coerce_dict(data, expected_index=idx))
             _upsert_l3(state, draft)
         elif sid == "final_audit":
-            state.final_verdict = FinalVerdict(**data)
+            state.final_verdict = FinalVerdict(**_coerce_dict(data, expected_index=None))
         elif sid.startswith("L4_adversarial_"):
             idx = int(sid.split("_")[2])
+            # L4_adversarial 本身就预期 list（AdversarialCut 数组）
+            if isinstance(data, dict) and "cuts" in data:
+                data = data["cuts"]
             cuts = [AdversarialCut(**c) for c in (data if isinstance(data, list) else [])]
             _upsert_l4_cuts(state, idx, cuts)
         elif sid.startswith("L4_scrubber_"):
             idx = int(sid.split("_")[2])
-            polished = L4PolishedChapter(**data)
+            polished = L4PolishedChapter(**_coerce_dict(data, expected_index=idx))
             polished.index = idx
             _upsert_l4_polished(state, polished)
     else:
@@ -151,6 +156,30 @@ def apply_responses(
         layer, idx = _parse_audit_target(step_ids[0])
         verdict = aggregate(layer, idx, reports)
         state.audit_history.append(verdict)
+
+
+def _coerce_dict(data, expected_index: int | None) -> dict:
+    """防御性容错：LLM 有时把单章 prompt 理解成"给我所有章节的列表"，返回 list 而不是 dict。
+
+    策略：
+    - data 已是 dict：直接返回
+    - data 是 list：找 index 匹配的那项；没有就取第一个 dict
+    - 其他：raise
+    """
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        if not data:
+            raise ValueError("LLM 返回空 list")
+        if expected_index is not None:
+            for item in data:
+                if isinstance(item, dict) and item.get("index") == expected_index:
+                    return item
+        for item in data:
+            if isinstance(item, dict):
+                return item
+        raise ValueError(f"list 里找不到 dict 项: {data}")
+    raise ValueError(f"无法处理的响应类型 {type(data).__name__}: {data}")
 
 
 def _upsert_l2(state: NovelState, outline: L2ChapterOutline) -> None:
@@ -345,10 +374,14 @@ def advance(
     dispatched = []
     for sid in expected:
         result = provider.query(sid, pdir)
-        if not result.ready and not _request_already_made(provider, sid, pdir):
-            text = build_prompt(state, sid)
-            provider.request(sid, text, pdir)
-            dispatched.append(sid)
+        if result.ready:
+            continue
+        if provider.has_pending_request(sid, pdir):
+            continue  # 已发请求，等响应（人在环路场景）
+        # 没发：dispatch（同步 provider 会原地完成）
+        text = build_prompt(state, sid)
+        provider.request(sid, text, pdir)
+        dispatched.append(sid)
 
     if dispatched:
         save_state(pdir, state)
@@ -394,9 +427,12 @@ def advance(
         next_expected = expected_prompts(new_next)
         for sid in next_expected:
             result = provider.query(sid, pdir)
-            if not result.ready:
-                text = build_prompt(state, sid)
-                provider.request(sid, text, pdir)
+            if result.ready:
+                continue
+            if provider.has_pending_request(sid, pdir):
+                continue
+            text = build_prompt(state, sid)
+            provider.request(sid, text, pdir)
         # 同步 provider 会直接准备好 → 下次 advance 会处理；异步则返回 "advanced"
         return {"status": "advanced", "step_ids": next_expected, "next_step": new_next}
 

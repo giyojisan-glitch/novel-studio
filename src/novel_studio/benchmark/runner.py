@@ -17,23 +17,80 @@ from .schemas import BenchmarkCase, BenchmarkVerdict
 BENCHMARKS_ROOT = Path(__file__).parent.parent.parent.parent / "benchmarks"
 
 
+# Supported source extensions
+_SOURCE_EXTS = (".md", ".txt")
+
+
+# 用户 corpus 子目录名 → styles/ 里存在的 genre
+# 对于没有对应 style pack 的类型，fallback 到最接近的
+GENRE_FALLBACK_MAP: dict[str, str] = {
+    "科幻": "科幻",
+    "悬疑": "悬疑",
+    "武侠": "武侠",
+    "都市": "都市",
+    "奇幻": "奇幻",
+    "仙侠": "仙侠",
+    # Fallback for types without a native style pack:
+    "恐怖": "悬疑",      # closest — both rely on dread/dark
+    "历史": "武侠",      # period-piece feel
+    "爱情": "都市",      # contemporary drama
+    "玄幻": "仙侠",      # eastern fantasy
+    "推理": "悬疑",      # same thing really
+}
+
+
 def _chinese_chars(text: str) -> int:
     return len(re.findall(r"[\u4e00-\u9fff]", text))
 
 
 def _guess_chapter_count(word_count: int, words_per_chapter: int = 1000) -> int:
     """根据原文字数决定要让 NOVEL-Studio 生成几章。"""
-    # Aim for similar total length
     n = max(1, min(10, round(word_count / words_per_chapter)))
     return n
+
+
+def _infer_genre_from_path(file_path: Path, corpus_root: Path, default: str = "科幻") -> str:
+    """按文件相对 corpus_root 的第一级目录推断 genre。
+
+    例：corpus_root=benchmarks/corpus, file=benchmarks/corpus/科幻/硬科幻/x.txt
+    → 第一级 = "科幻" → genre = "科幻"
+    """
+    try:
+        rel = file_path.relative_to(corpus_root)
+    except ValueError:
+        return default
+    if len(rel.parts) < 2:
+        return default  # 直接在 corpus 根下
+    top_dir = rel.parts[0]
+    return GENRE_FALLBACK_MAP.get(top_dir, default)
+
+
+def _collect_source_files(corpus_dir: Path, recursive: bool = True) -> list[Path]:
+    """扫描目录，返回所有 .md / .txt 文件（忽略 _*, .*）。"""
+    corpus_dir = Path(corpus_dir)
+    results: list[Path] = []
+    if recursive:
+        iterator = corpus_dir.rglob("*")
+    else:
+        iterator = corpus_dir.glob("*")
+    for f in iterator:
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in _SOURCE_EXTS:
+            continue
+        if f.name.startswith("_") or f.name.startswith("."):
+            continue
+        results.append(f)
+    return sorted(results)
 
 
 def run_single(
     original_path: Path,
     provider: AnthropicProvider | None = None,
     pipeline_version: str = "v1",
-    genre: str = "科幻",
+    genre: str | None = None,
     max_steps: int = 100,
+    corpus_root: Path | None = None,
 ) -> tuple[BenchmarkCase, BenchmarkVerdict]:
     """跑单个 case：原文 → premise → 生成 → 评估。
 
@@ -43,6 +100,13 @@ def run_single(
     original_path = Path(original_path)
     original_text = original_path.read_text(encoding="utf-8")
     original_wc = _chinese_chars(original_text)
+
+    # Auto-infer genre from directory structure if not given
+    if genre is None:
+        if corpus_root is not None:
+            genre = _infer_genre_from_path(original_path, corpus_root)
+        else:
+            genre = "科幻"
 
     case_name = original_path.stem
     BENCHMARKS_ROOT.mkdir(exist_ok=True)
@@ -122,28 +186,32 @@ def run_batch(
     corpus_dir: Path,
     provider: AnthropicProvider | None = None,
     pipeline_version: str = "v1",
-    genre: str = "科幻",
-    pattern: str = "*.md",
+    genre: str | None = None,
+    recursive: bool = True,
+    limit: int | None = None,
 ) -> list[tuple[BenchmarkCase, BenchmarkVerdict]]:
-    """批量跑整个目录下的所有短篇文件。"""
+    """批量跑整个目录下的所有短篇文件（支持 .md / .txt + 递归 + 自动 genre）。
+
+    genre=None 时自动从父目录推断（例如 corpus/科幻/xxx.txt → 科幻）。
+    limit 限制跑几篇（用于试水）。
+    """
     provider = provider or AnthropicProvider()
     corpus_dir = Path(corpus_dir)
-    files = sorted(corpus_dir.glob(pattern))
+    files = _collect_source_files(corpus_dir, recursive=recursive)
+    if limit is not None:
+        files = files[:limit]
+
     results = []
     for f in files:
-        # 跳过隐藏/模板文件
-        if f.name.startswith("_") or f.name.startswith("."):
-            continue
         try:
             case, verdict = run_single(
-                f, provider=provider, pipeline_version=pipeline_version, genre=genre,
+                f, provider=provider, pipeline_version=pipeline_version,
+                genre=genre, corpus_root=corpus_dir,
             )
             results.append((case, verdict))
         except Exception as e:
-            # 单个失败不打断 batch
             print(f"[BENCHMARK FAIL] {f.name}: {e}")
 
-    # 写总 summary
     if results:
         summary_path = BENCHMARKS_ROOT / "reports" / "_SUMMARY.md"
         summary_path.write_text(_render_summary(results), encoding="utf-8")
