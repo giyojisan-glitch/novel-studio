@@ -10,7 +10,8 @@ from .state import NovelState, UserInput
 from .utils import make_project_dir, save_state, load_state, queue_pending, resolve_input_file, INPUTS_ROOT, export_artifacts, ARTIFACTS_ROOT
 from .engine import advance
 from .slop_check import scan as slop_scan
-from .llm import get_provider
+from .llm import get_provider, AnthropicProvider
+from .benchmark import run_single as bench_run_single, run_batch as bench_run_batch
 
 
 console = Console()
@@ -88,6 +89,98 @@ def cmd_artifacts(args):
     for f in sorted(adir.glob("*.md")):
         size_kb = f.stat().st_size / 1024
         console.print(f"  • {f.name}  [dim]({size_kb:.1f} KB)[/]")
+
+
+def cmd_benchmark_one(args):
+    """单个 corpus 文件跑 benchmark：extract premise → generate → judge。"""
+    path = Path(args.file)
+    if not path.exists():
+        console.print(f"[red]✗[/] 文件不存在：{path}")
+        sys.exit(1)
+
+    provider = AnthropicProvider()
+    if not provider.api_key:
+        console.print("[red]✗[/] benchmark 需要 ANTHROPIC_API_KEY。请设置后再跑。")
+        sys.exit(1)
+
+    console.print(f"[cyan]→[/] Benchmarking [bold]{path.name}[/]...")
+    console.print(f"[dim]  pipeline={args.pipeline} · genre={args.genre}[/]")
+
+    case, verdict = bench_run_single(
+        path, provider=provider,
+        pipeline_version=args.pipeline, genre=args.genre,
+    )
+
+    color = "green" if verdict.passed else "red"
+    mark = "✅ PASS" if verdict.passed else "❌ FAIL"
+    console.print(f"\n[bold {color}]{mark}[/]  总分 {verdict.overall_score:.3f} / 1.000  (阈值 0.70)")
+    console.print(f"[dim]  judge: {verdict.judge_model}[/]\n")
+
+    t = Table(show_header=True, header_style="bold")
+    t.add_column("维度")
+    t.add_column("分数", justify="right")
+    t.add_column("权重", justify="right")
+    t.add_column("理由", overflow="fold")
+    from .benchmark.schemas import DIMENSION_WEIGHTS
+    for ds in verdict.dimension_scores:
+        w = DIMENSION_WEIGHTS.get(ds.dimension, 0.0)
+        t.add_row(ds.dimension, f"{ds.score:.2f}", f"{w:.0%}", ds.rationale)
+    console.print(t)
+
+    if verdict.notes:
+        console.print(f"\n[yellow]法官点评：[/]{verdict.notes}")
+
+    from .benchmark.runner import BENCHMARKS_ROOT
+    console.print(f"\n📄 详细报告：[cyan]{BENCHMARKS_ROOT / 'reports' / (case.name + '.md')}[/]")
+
+
+def cmd_benchmark_batch(args):
+    """批量跑 corpus 目录下所有 .md 文件。"""
+    corpus = Path(args.corpus_dir)
+    if not corpus.is_dir():
+        console.print(f"[red]✗[/] 目录不存在：{corpus}")
+        sys.exit(1)
+
+    provider = AnthropicProvider()
+    if not provider.api_key:
+        console.print("[red]✗[/] benchmark 需要 ANTHROPIC_API_KEY。")
+        sys.exit(1)
+
+    files = sorted(f for f in corpus.glob("*.md") if not f.name.startswith(("_", ".")))
+    if not files:
+        console.print(f"[yellow]⚠[/] {corpus}/ 下没有 .md 文件（忽略 _开头的模板）")
+        sys.exit(0)
+
+    console.print(f"[cyan]→[/] 批量跑 [bold]{len(files)}[/] 个案例\n")
+
+    results = bench_run_batch(
+        corpus, provider=provider,
+        pipeline_version=args.pipeline, genre=args.genre,
+    )
+
+    if not results:
+        console.print("[red]✗ 全部失败[/]")
+        sys.exit(1)
+
+    passed = sum(1 for _, v in results if v.passed)
+    pass_rate = passed / len(results)
+    avg = sum(v.overall_score for _, v in results) / len(results)
+
+    color = "green" if pass_rate >= 0.70 else "yellow" if pass_rate >= 0.50 else "red"
+    console.print(f"\n[bold {color}]Pass Rate: {passed}/{len(results)} = {pass_rate:.1%}[/]")
+    console.print(f"[dim]Average score: {avg:.3f}[/]\n")
+
+    t = Table(show_header=True, header_style="bold")
+    t.add_column("案例")
+    t.add_column("总分", justify="right")
+    t.add_column("判定", justify="center")
+    for case, verdict in results:
+        status = "[green]✅[/]" if verdict.passed else "[red]❌[/]"
+        t.add_row(case.name, f"{verdict.overall_score:.3f}", status)
+    console.print(t)
+
+    from .benchmark.runner import BENCHMARKS_ROOT
+    console.print(f"\n📄 Summary: [cyan]{BENCHMARKS_ROOT / 'reports' / '_SUMMARY.md'}[/]")
 
 
 def cmd_slop(args):
@@ -214,6 +307,23 @@ def main():
     p_slop.add_argument("file", help="要扫描的 markdown / 文本文件")
     p_slop.add_argument("-v", "--verbose", action="store_true", help="显示所有命中（默认只 Top 10）")
     p_slop.set_defaults(func=cmd_slop)
+
+    p_bone = sub.add_parser("benchmark-one",
+                             help="对单篇短篇跑 TDD 评估（extract→generate→judge）")
+    p_bone.add_argument("file", help="原文 markdown 路径")
+    p_bone.add_argument("--genre", default="科幻",
+                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠"])
+    p_bone.add_argument("--pipeline", default="v1", choices=["v1", "v2"],
+                        help="NOVEL-Studio pipeline 版本（v2 含 L4 润色，更贵）")
+    p_bone.set_defaults(func=cmd_benchmark_one)
+
+    p_ball = sub.add_parser("benchmark",
+                             help="批量跑 corpus/ 下所有短篇")
+    p_ball.add_argument("corpus_dir", help="放 .md 原文的目录（如 benchmarks/corpus）")
+    p_ball.add_argument("--genre", default="科幻",
+                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠"])
+    p_ball.add_argument("--pipeline", default="v1", choices=["v1", "v2"])
+    p_ball.set_defaults(func=cmd_benchmark_batch)
 
     args = parser.parse_args()
     try:

@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **TDD-style benchmark framework** (`src/novel_studio/benchmark/`)
+  - Inspired by a user insight: "有点测试驱动编程的感觉" — human-written short stories are the *expected output*
+  - Workflow: read original → reverse-extract a 150-char premise (ending-safe) → run through NOVEL-Studio → LLM-as-judge 6-dimension similarity scoring → pass/fail at 0.70
+  - 6 weighted dimensions: plot_structure (25%), character_core (20%), world_anchors (15%), tone (15%), ending_vector (15%), key_scenes (10%)
+  - CLI: `novel-studio benchmark-one <file>` / `novel-studio benchmark <corpus-dir>`
+  - Auto-generates per-case report + `_SUMMARY.md` with pass rate and per-dimension averages
+  - `benchmarks/` directory layout: `corpus/` (user-provided stories), `premises/` / `generated/` / `reports/` / `projects/` (auto-generated, gitignored)
+  - 21 new tests covering weights invariants, schema roundtrips, prompt format, judge parsing (including malformed-list response tolerance), premise extractor with mocks, chapter-count heuristics
 - **V2.1 Autonomous AnthropicProvider** — real Claude API calls, no Claude Code session required
   - 2-tier retry: API errors (exponential backoff × 3) + malformed JSON (with hint, × 2)
   - Markdown code fence stripping (handles LLM responses wrapped in ```json)

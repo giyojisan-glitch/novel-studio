@@ -30,6 +30,13 @@ projects/
 outputs/
 artifacts/
 
+# Benchmark corpus (user's private short stories) and generated artifacts
+benchmarks/corpus/
+benchmarks/premises/
+benchmarks/generated/
+benchmarks/reports/
+benchmarks/projects/
+
 # User inputs (keep only templates and examples)
 inputs/*
 !inputs/_TEMPLATE.md
