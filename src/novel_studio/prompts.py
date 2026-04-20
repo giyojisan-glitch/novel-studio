@@ -378,6 +378,29 @@ def audit_prompt(state: NovelState, layer: str, target_idx: int | None, head: st
     )
 
 
+def _load_genre_author_whitelist(genre: str) -> list[str]:
+    """读 styles/inspiration_routing.json，按 genre 返回作家白名单。
+
+    - 找不到配置文件 / 解析失败 → 返回 []（等价无过滤）
+    - genre 没在 mapping 里 → 返回 []（无过滤，全库检索）
+    - genre 列表为空 [] → 返回 []（显式声明无过滤）
+    - genre 有列表 → 返回那个 list（retriever 会把 query 限制到这些作家）
+    """
+    import json
+    path = STYLES_ROOT / "inspiration_routing.json"
+    if not path.exists():
+        return []
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        authors = config.get(genre, [])
+        # 剔除元数据字段（_comment 等）
+        if not isinstance(authors, list):
+            return []
+        return [a for a in authors if isinstance(a, str) and a]
+    except Exception:
+        return []
+
+
 def _inspiration_few_shot(state: NovelState, l2) -> str:
     """L3 生成前：用 L2 summary + hook 作 query，从灵感库拉 3 个最像的片段注入 prompt。
 
@@ -387,6 +410,8 @@ def _inspiration_few_shot(state: NovelState, l2) -> str:
     - 每段带标签「【作家·作品】」，让 AI 知道是引用不是原创
     - 明确说"这是参考腔调和质感，不是抄情节"——防止 AI 直接套抄
     - `NOVEL_STUDIO_NO_RAG=1` 环境变量 → 强制禁用 RAG（A/B 对照实验用）
+    - **Genre → 作家白名单路由**：`styles/inspiration_routing.json` 定义每个 genre 允许
+      检索的作家，避免 corpus 不均衡时 genre 不匹配被淹没（志怪 query 拉到武侠的坑）
     """
     import os
     if os.getenv("NOVEL_STUDIO_NO_RAG") == "1":
@@ -405,8 +430,14 @@ def _inspiration_few_shot(state: NovelState, l2) -> str:
             return ""
 
         query_text = f"{l2.summary}\n\n{l2.hook}"
+        # Genre → 作家白名单过滤（见 _load_genre_author_whitelist）
+        author_whitelist = _load_genre_author_whitelist(state.user_input.genre)
         chunks = retriever.retrieve(StyleQuery(
-            query_text=query_text, top_k=3, min_chinese_chars=60, max_chinese_chars=400,
+            query_text=query_text,
+            top_k=3,
+            authors=author_whitelist,  # 空列表 = 不过滤
+            min_chinese_chars=60,
+            max_chinese_chars=400,
         ))
         if not chunks:
             return ""
