@@ -143,7 +143,14 @@ L3_TASK = """## 任务
 {schema}
 ```
 
-`content` 字段放纯正文文本（可以有换行，用 "\\n" 表示）；`word_count` 是中文字符数（不含标点）；`index` 是 {chapter_idx}；`revision` 是 {revision}。
+`content` 字段放纯正文文本；`word_count` 是中文字符数（不含标点）；`index` 是 {chapter_idx}；`revision` 是 {revision}。
+
+## 🔴 JSON 格式铁律（违反会导致整章作废）
+- **第一个字符必须是 `{{`**；不要 markdown 包裹，不要写任何解释
+- **`content` 里的换行用 `\\n`**（literal 两字符：反斜杠+n），**不要真实换行**
+- **`content` 里的引号用中文 `「」`**，不要用英文 `"` 或 `'`
+- **`content` 里不要出现孤立反斜杠 `\\ `**（反斜杠+空格）—— 这会炸 JSON 解析器
+- **不要在字符串值里用 markdown 语法**（比如 `**加粗**` `- 列表`）
 """
 
 
