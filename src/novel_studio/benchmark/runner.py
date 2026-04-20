@@ -32,10 +32,19 @@ GENRE_FALLBACK_MAP: dict[str, str] = {
     "仙侠": "仙侠",
     # Fallback for types without a native style pack:
     "恐怖": "悬疑",      # closest — both rely on dread/dark
-    "历史": "武侠",      # period-piece feel
+    "历史": "历史",      # 2026-04-20: now has native style pack
     "爱情": "都市",      # contemporary drama
     "玄幻": "仙侠",      # eastern fantasy
     "推理": "悬疑",      # same thing really
+    # 日系なろう系
+    "日轻": "日轻",
+    "悪役令嬢": "日轻",
+    "JP": "日轻",
+    "ja": "日轻",
+    # 中式志怪/禅意笔记短篇
+    "志怪": "志怪",
+    "笔记": "志怪",
+    "聊斋": "志怪",
 }
 
 

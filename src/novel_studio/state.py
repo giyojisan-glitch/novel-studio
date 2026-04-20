@@ -4,7 +4,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
-Genre = Literal["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻"]
+Genre = Literal["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻", "志怪"]
 Language = Literal["zh", "ja"]
 Layer = Literal["L1", "L2", "L3", "L4"]
 AuditHead = Literal["logic", "pace", "style", "character"]
