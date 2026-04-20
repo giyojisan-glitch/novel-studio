@@ -234,7 +234,12 @@ def write_prompt(pdir: Path, step_id: str, prompt: str) -> Path:
 
 
 def read_response(pdir: Path, step_id: str) -> dict | None:
-    """读 Claude 写入的响应。返回 None 表示还没响应。"""
+    """读 Claude 写入的响应。返回 None 表示还没响应。
+
+    JSON 解析失败时：raise JSONDecodeError 并在 msg 里带上**具体文件路径 + 行列号**，
+    方便定位（benchmark 跑多篇时某一篇 response 有非法引号导致解析失败，
+    默认的 `Expecting ',' delimiter: line 1 col 241` 不指哪篇会很难查）。
+    """
     p = pdir / "responses" / f"{step_id}.response.json"
     if not p.exists():
         return None
@@ -242,7 +247,15 @@ def read_response(pdir: Path, step_id: str) -> dict | None:
     if not text:
         return None
     text = _strip_code_fence(text)
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # 带上文件路径 + 行列号重抛，方便 debug
+        raise json.JSONDecodeError(
+            f"{e.msg} (file: {p}, line {e.lineno} col {e.colno})",
+            e.doc,
+            e.pos,
+        ) from e
 
 
 def _strip_code_fence(text: str) -> str:
