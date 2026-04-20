@@ -47,6 +47,7 @@ def cmd_init(args):
             chapter_count=args.chapters,
             target_words_per_chapter=args.words,
             language=args.language,
+            creativity=args.creativity,
             pipeline_version="v2" if args.v2 else "v1",
         )
     )
@@ -60,7 +61,8 @@ def cmd_init(args):
         f"[bold cyan]NOVEL-Studio[/] 项目已创建\n\n"
         f"📁 [yellow]{pdir}[/]\n"
         f"📖 前提：{args.premise}\n"
-        f"🎭 类型：{args.genre} · 章节数：{args.chapters} · 每章 {args.words} 字\n",
+        f"🎭 类型：{args.genre} · 章节数：{args.chapters} · 每章 {args.words} 字\n"
+        f"🎚 创意档位：[bold]{args.creativity}[/]\n",
         title="✓ init"
     ))
     _print_status(state, pdir, result)
@@ -382,6 +384,9 @@ def main():
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
     p_init.add_argument("--v2", action="store_true",
                         help="启用 V2 pipeline（final_audit + L4 adversarial + L4 scrubber）")
+    p_init.add_argument("--creativity", default="balanced",
+                        choices=["strict", "balanced", "creative"],
+                        help="创意档位：strict(严格按 premise, temp=0.3) / balanced(默认, temp=0.7) / creative(大胆补全, temp=1.0)")
     p_init.add_argument("--provider", default=None,
                         help="LLM provider: human_queue (默认) / anthropic / stub")
     p_init.set_defaults(func=cmd_init)

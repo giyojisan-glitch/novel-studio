@@ -36,6 +36,7 @@ class BaseProvider(ABC):
     """
 
     name: str = "base"
+    creativity: str = "balanced"  # strict / balanced / creative — engine 从 state 注入，provider 按需使用
 
     @abstractmethod
     def request(self, step_id: str, prompt: str, pdir: Path) -> None:

@@ -361,6 +361,8 @@ def advance(
               传入 StubProvider 可跑 smoke test；传入 AnthropicProvider 全自动。
     """
     provider = provider or DEFAULT_PROVIDER
+    # 同步 creativity 档位到 provider（strict/balanced/creative → 温度 / prompt 头）
+    provider.creativity = state.user_input.creativity
 
     if state.next_step == "finalize":
         return _do_finalize(state, pdir)

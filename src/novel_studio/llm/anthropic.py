@@ -139,14 +139,27 @@ class AnthropicProvider(BaseProvider):
             f"AnthropicProvider JSON 解析重试 {self.max_json_retries} 次仍失败：{last_error}"
         )
 
+    # 创意档位 → temperature 映射
+    _CREATIVITY_TEMPERATURE = {
+        "strict": 0.3,       # 严格按 premise 推进，低随机性
+        "balanced": 0.7,     # 默认平衡档
+        "creative": 1.0,     # 大胆补全，高随机性
+    }
+
+    def _temperature_for_creativity(self) -> float:
+        return self._CREATIVITY_TEMPERATURE.get(self.creativity, 0.7)
+
     def _call_api_with_backoff(self, prompt: str) -> str:
         import anthropic
+
+        temperature = self._temperature_for_creativity()
 
         for api_attempt in range(self.max_api_retries):
             try:
                 msg = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
+                    temperature=temperature,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 text = "".join(

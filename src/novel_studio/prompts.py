@@ -129,10 +129,37 @@ def _lang_meta_header(language: str) -> str:
     return _LANG_HEADER_META.get(language, "")
 
 
-def l3_system_for(genre: str, language: str = "zh") -> str:
+# ============ 创意档位头（strict / balanced / creative） ============
+# balanced 不加任何 header（模型默认行为）；strict / creative 显式注入约束。
+# 对应 AnthropicProvider._CREATIVITY_TEMPERATURE：temp 0.3 / 0.7 / 1.0
+_CREATIVITY_HEADER = {
+    "strict": (
+        "🎯 **创意档位：STRICT（严格）**\n"
+        "本次生成要求**严格按 premise 推进**。具体约束：\n"
+        "- 不得添加 premise 未明示的**主要人物**（配角可轻度补全，但不要抢戏）\n"
+        "- 不得添加 premise 未暗示的**关键转折**（诸如「原来主角是双胞胎」这种反转禁止）\n"
+        "- 不得替换 premise 指定的**场景锚点**（场景地点 / 时代 / 物件要忠实保留）\n"
+        "- 不得改动 premise 暗示的**结局方向**（悲剧不能强行圆满，反之亦然）\n"
+        "- 角色心理、动作细节、环境描写仍可自由发挥——限制的是**剧情主脊**不是**文本颗粒度**\n\n"
+    ),
+    "balanced": "",  # 默认档，不加 header
+    "creative": (
+        "🎨 **创意档位：CREATIVE（创意）**\n"
+        "本次生成**鼓励大胆补全**。具体方向：\n"
+        "- premise 中未明说的人物关系、背景设定，可以**合理补全**成有张力的版本\n"
+        "- 允许加入 premise 未提的**次要角色**或**意外转折**，只要服务于主线\n"
+        "- 鼓励用**非常规叙事手段**（非线性时间、多视角、象征）来承载 premise 的内核\n"
+        "- 不要把 premise 当说明书——把它当**种子**，生长出它自己也没想到的分支\n"
+        "- 唯一底线：不要和 premise **直接矛盾**（背景设定 / 结局走向如果要反转，要自洽）\n\n"
+    ),
+}
+
+
+def l3_system_for(genre: str, language: str = "zh", creativity: str = "balanced") -> str:
     style = _load_style(genre)
-    header = _LANG_HEADER.get(language, "")
-    base = header + L3_SYSTEM_BASE
+    creativity_header = _CREATIVITY_HEADER.get(creativity, "")
+    lang_header = _LANG_HEADER.get(language, "")
+    base = creativity_header + lang_header + L3_SYSTEM_BASE
     if not style:
         return base
     return base + "\n\n" + style
@@ -245,7 +272,8 @@ def l1_prompt(state: NovelState) -> str:
     ui = state.user_input
     retry = _retry_hint(state, "L1")
     return (
-        _lang_meta_header(ui.language)
+        _CREATIVITY_HEADER.get(ui.creativity, "")
+        + _lang_meta_header(ui.language)
         + L1_SYSTEM.format(chapter_count=ui.chapter_count, words_per_chapter=ui.target_words_per_chapter)
         + "\n\n"
         + L1_TASK.format(
@@ -265,7 +293,8 @@ def l2_prompt(state: NovelState, chapter_idx: int) -> str:
     ) or "（这是第一章）"
     retry = _retry_hint(state, f"L2_{chapter_idx}")
     return (
-        _lang_meta_header(state.user_input.language)
+        _CREATIVITY_HEADER.get(state.user_input.creativity, "")
+        + _lang_meta_header(state.user_input.language)
         + L2_SYSTEM
         + "\n\n"
         + L2_TASK.format(
@@ -293,7 +322,7 @@ def l3_prompt(state: NovelState, chapter_idx: int) -> str:
     inspiration_block = _inspiration_few_shot(state, l2)
 
     return (
-        l3_system_for(state.user_input.genre, state.user_input.language)
+        l3_system_for(state.user_input.genre, state.user_input.language, state.user_input.creativity)
         + inspiration_block
         + "\n\n"
         + L3_TASK.format(

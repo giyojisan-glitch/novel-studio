@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 Genre = Literal["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻", "志怪"]
 Language = Literal["zh", "ja"]
+Creativity = Literal["strict", "balanced", "creative"]
 Layer = Literal["L1", "L2", "L3", "L4"]
 AuditHead = Literal["logic", "pace", "style", "character"]
 
@@ -16,6 +17,9 @@ class UserInput(BaseModel):
     chapter_count: int = Field(3, ge=1, le=10)
     target_words_per_chapter: int = Field(1000, ge=300, le=3000)
     language: Language = "zh"
+    # 创意档位：strict（严格按 premise）/ balanced（平衡）/ creative（大胆补全）
+    # 影响 temperature + 每层 prompt 里的创意自由度指令
+    creativity: Creativity = "balanced"
     # V2: pipeline 版本 —— v1 维持旧行为（L3 → finalize，L4 透传）
     #                    v2 启用新管道（L3 → final_audit → L4_adversarial → L4_scrubber → finalize）
     pipeline_version: Literal["v1", "v2"] = "v1"
