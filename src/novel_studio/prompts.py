@@ -288,8 +288,13 @@ def l3_prompt(state: NovelState, chapter_idx: int) -> str:
             prev_tail = prev_draft.content[-150:]
     retry = _retry_hint(state, f"L3_{chapter_idx}")
     l1 = state.l1
+
+    # —— 灵感库 RAG 注入（最初 vision 的 Cross-Attention 式分层参考） ——
+    inspiration_block = _inspiration_few_shot(state, l2)
+
     return (
         l3_system_for(state.user_input.genre, state.user_input.language)
+        + inspiration_block
         + "\n\n"
         + L3_TASK.format(
             chapter_idx=chapter_idx,
@@ -342,6 +347,51 @@ def audit_prompt(state: NovelState, layer: str, target_idx: int | None, head: st
             head=head,
         )
     )
+
+
+def _inspiration_few_shot(state: NovelState, l2) -> str:
+    """L3 生成前：用 L2 summary + hook 作 query，从灵感库拉 3 个最像的片段注入 prompt。
+
+    设计：
+    - 库空/model 未下载 → 静默返回空字符串，不影响现有流程
+    - 库有内容 → 插入一段「## 风格参考片段（来自灵感库）」的 few-shot
+    - 每段带标签「【作家·作品】」，让 AI 知道是引用不是原创
+    - 明确说"这是参考腔调和质感，不是抄情节"——防止 AI 直接套抄
+    """
+    try:
+        from .inspiration.retriever import get_retriever
+        from .inspiration.schemas import StyleQuery
+
+        retriever = get_retriever()
+        # 库空 → 返回空，不触发模型下载
+        try:
+            if retriever.collection.count() == 0:
+                return ""
+        except Exception:
+            return ""
+
+        query_text = f"{l2.summary}\n\n{l2.hook}"
+        chunks = retriever.retrieve(StyleQuery(
+            query_text=query_text, top_k=3, min_chinese_chars=60, max_chinese_chars=400,
+        ))
+        if not chunks:
+            return ""
+
+        lines = [
+            "\n\n## 🎨 风格参考片段（灵感库检索）",
+            "以下是从你的灵感库里检索出的最接近本章语境的几段原文。**模仿其腔调、质感、节奏**，不要抄情节，不要直接借用原文句子：",
+            "",
+        ]
+        for i, c in enumerate(chunks, 1):
+            lines.append(f"### 参考 {i} · {c.short_label()}")
+            lines.append(f"> {c.text}")
+            lines.append("")
+        lines.append("---")
+        lines.append("*以上是参考腔调。下面按 premise / L1 / L2 正常写本章，用你自己的情节和句子。*")
+        return "\n".join(lines)
+    except Exception:
+        # 灵感库不可用时静默 fallback（chromadb/sentence-transformers 未装也不影响）
+        return ""
 
 
 def _retry_hint(state: NovelState, step_key: str) -> str:

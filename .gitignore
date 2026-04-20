@@ -37,6 +37,15 @@ benchmarks/generated/
 benchmarks/reports/
 benchmarks/projects/
 
+# Inspiration library (user's private reference works; copyright concerns)
+inspirations/*
+!inspirations/_README.md
+!inspirations/.gitkeep
+
+# Chroma vector store
+.chroma/
+chroma_db/
+
 # User inputs (keep only templates and examples)
 inputs/*
 !inputs/_TEMPLATE.md

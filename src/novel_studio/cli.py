@@ -188,6 +188,96 @@ def cmd_benchmark_batch(args):
     console.print(f"\n📄 Summary: [cyan]{BENCHMARKS_ROOT / 'reports' / '_SUMMARY.md'}[/]")
 
 
+def cmd_inspire_ingest(args):
+    """扫 inspirations/ → chunk → embed → Chroma."""
+    from .inspiration.ingester import ingest_all, INSPIRATIONS_ROOT
+    if not INSPIRATIONS_ROOT.exists() or not any(
+        p.is_dir() and not p.name.startswith(("_", "."))
+        for p in INSPIRATIONS_ROOT.iterdir()
+    ):
+        console.print(f"[yellow]⚠[/] {INSPIRATIONS_ROOT}/ 下没有作家目录。")
+        console.print(f"[dim]放作品进去：inspirations/{{作家}}/{{作品}}.txt[/]")
+        sys.exit(0)
+    console.print("[cyan]→[/] 扫描 + 消化灵感库...")
+    console.print("[dim]首次运行会下载 BAAI/bge-large-zh-v1.5（~1.3 GB），请耐心。[/]\n")
+    stats = ingest_all(rebuild=args.rebuild)
+    console.print(Panel.fit(
+        f"✓ 灵感库消化完成\n\n"
+        f"作家：{len(stats['authors'])} 位（{', '.join(stats['authors'])}）\n"
+        f"作品：{len(stats['works'])} 部\n"
+        f"新 chunks：{stats['new_chunks']}\n"
+        f"跳过（已有）：{stats['skipped']}\n"
+        f"库内总量：{stats['total_in_db']}",
+        title="inspire ingest"
+    ))
+
+
+def cmd_inspire_query(args):
+    """测试检索——看给定关键词最接近的片段是啥。"""
+    from .inspiration.retriever import get_retriever
+    from .inspiration.schemas import StyleQuery
+    console.print(f"[cyan]→[/] Query: [bold]{args.text}[/]")
+    q = StyleQuery(query_text=args.text, top_k=args.top, authors=args.author)
+    chunks = get_retriever().retrieve(q)
+    if not chunks:
+        console.print("[yellow]⚠ 没有检索到结果（库空了？）[/]")
+        return
+    for i, c in enumerate(chunks, 1):
+        console.print(f"\n[bold cyan]{i}. {c.short_label()}[/] "
+                      f"[dim](pos {c.position}/{c.total_chunks}, {c.chinese_chars} 字)[/]")
+        console.print(f"  {c.text[:200]}{'...' if len(c.text) > 200 else ''}")
+
+
+def cmd_inspire_list(args):
+    """列出灵感库现有作家/作品 + chunk 数统计。"""
+    from .inspiration.ingester import INSPIRATIONS_ROOT, CHROMA_ROOT, COLLECTION_NAME
+    if not INSPIRATIONS_ROOT.exists():
+        console.print(f"[yellow]⚠[/] {INSPIRATIONS_ROOT}/ 不存在")
+        return
+
+    import chromadb
+    from collections import Counter
+    try:
+        client = chromadb.PersistentClient(path=str(CHROMA_ROOT))
+        coll = client.get_collection(COLLECTION_NAME)
+        all_items = coll.get(include=["metadatas"])
+        metas = all_items.get("metadatas", [])
+        total = len(metas)
+    except Exception:
+        metas = []
+        total = 0
+
+    console.print(f"[bold]Inspiration Library[/] ({total} chunks)\n")
+    # 按作家/作品聚合
+    by_work: Counter = Counter()
+    for m in metas:
+        by_work[(m.get("author", "?"), m.get("work", "?"))] += 1
+    if not by_work:
+        console.print("[dim]（库里没东西——还没跑过 ingest？）[/]")
+    else:
+        last_author = None
+        for (author, work), count in sorted(by_work.items()):
+            if author != last_author:
+                console.print(f"[bold cyan]{author}[/]")
+                last_author = author
+            console.print(f"  • {work}: [green]{count}[/] chunks")
+
+    # 目录里有但没 ingest 的文件
+    disk_files = []
+    for d in sorted(INSPIRATIONS_ROOT.iterdir()):
+        if not d.is_dir() or d.name.startswith(("_", ".")):
+            continue
+        for f in d.glob("*.txt"):
+            key = (d.name, f.stem)
+            if key not in by_work:
+                disk_files.append(key)
+    if disk_files:
+        console.print(f"\n[yellow]⚠ 目录里有但未 ingest 的 ({len(disk_files)})[/]：")
+        for author, work in disk_files:
+            console.print(f"  • {author}/{work}")
+        console.print("[dim]跑 `novel-studio inspire ingest` 消化[/]")
+
+
 def cmd_slop(args):
     """机械 slop 扫描：不调 LLM，仅用词表+正则。"""
     path = Path(args.file)
@@ -338,6 +428,25 @@ def main():
     p_ball.add_argument("--no-recursive", action="store_true",
                         help="只扫 corpus_dir 顶层，不进子目录")
     p_ball.set_defaults(func=cmd_benchmark_batch)
+
+    # ---------------- Inspiration RAG ----------------
+    p_insp = sub.add_parser("inspire", help="灵感库 (Lora-style RAG)")
+    insp_sub = p_insp.add_subparsers(dest="inspire_cmd", required=True)
+
+    p_ing = insp_sub.add_parser("ingest",
+                                help="扫 inspirations/ 目录，切 chunk，embed，存 Chroma")
+    p_ing.add_argument("--rebuild", action="store_true",
+                       help="删除已有 collection 重建（慎用——会重新 embed 所有文件）")
+    p_ing.set_defaults(func=cmd_inspire_ingest)
+
+    p_q = insp_sub.add_parser("query", help="测试检索：打几个关键词查最像的片段")
+    p_q.add_argument("text", help="查询文本（可以是 L2 hook 或想参考的语境）")
+    p_q.add_argument("--top", type=int, default=5)
+    p_q.add_argument("--author", action="append", help="限定作家（可多次）")
+    p_q.set_defaults(func=cmd_inspire_query)
+
+    p_list = insp_sub.add_parser("list", help="列出当前灵感库内容")
+    p_list.set_defaults(func=cmd_inspire_list)
 
     args = parser.parse_args()
     try:
