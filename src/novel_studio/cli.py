@@ -3,6 +3,14 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+
+# 自动加载 .env（同级目录或向上找），让 ANTHROPIC_API_KEY 等无需 export
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv 可选；没装也不影响显式 export 的用户
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table

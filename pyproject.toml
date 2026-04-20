@@ -13,6 +13,7 @@ dependencies = [
     "json5>=0.14.0",
     "chromadb>=1.5.8",
     "sentence-transformers>=5.4.1",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
