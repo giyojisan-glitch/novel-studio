@@ -94,8 +94,9 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 
 ### A/B validated signals (see `docs/TRAINING_METHODOLOGY.md`)
 
-- Inspiration RAG produces **15-40% style shift** toward the seeded author (stronger on models with heavier default biases — larger correction room)
-- Multi-author semantic routing: **27/30 = 90% correct** author retrieval even at 10:1 corpus imbalance
+- **Inspiration RAG produces real style transfer**: when seeded with 蒲松龄 (Liaozhai ghost stories) and run on a 志怪 premise, the output exhibits Liaozhai-specific motifs that are absent in both the no-RAG control and the mis-routed (温瑞安 武侠) variant — e.g. faceless figures under a hat, hollow-sleeved ghosts, terse fact-based narration ("owed three bowls of wine at West Gate, promised to repay within thirty years"), and the Liaozhai-characteristic fact-as-ending closing line. **60-70% offset from control**.
+- **Pure semantic retrieval alone is insufficient**: under 10:1 corpus imbalance, modern-Chinese L2 queries get embedded closer to modern-prose corpus than to classical-Chinese text, regardless of theme. Solved by `styles/inspiration_routing.json` — a user-editable **genre → author whitelist** that applies deterministic metadata filtering at retrieval time.
+- Single-author style shift (温瑞安 武侠 RAG on a 武侠 premise): **15-40% offset** from control (stronger on models with more default bias — larger correction room).
 
 ### What's missing (and why it's hard)
 
