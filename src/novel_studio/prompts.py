@@ -386,7 +386,12 @@ def _inspiration_few_shot(state: NovelState, l2) -> str:
     - 库有内容 → 插入一段「## 风格参考片段（来自灵感库）」的 few-shot
     - 每段带标签「【作家·作品】」，让 AI 知道是引用不是原创
     - 明确说"这是参考腔调和质感，不是抄情节"——防止 AI 直接套抄
+    - `NOVEL_STUDIO_NO_RAG=1` 环境变量 → 强制禁用 RAG（A/B 对照实验用）
     """
+    import os
+    if os.getenv("NOVEL_STUDIO_NO_RAG") == "1":
+        return ""
+
     try:
         from .inspiration.retriever import get_retriever
         from .inspiration.schemas import StyleQuery

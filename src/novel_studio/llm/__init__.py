@@ -13,6 +13,7 @@ from .base import BaseProvider, ProviderResult
 from .human_queue import HumanQueueProvider
 from .stub import StubProvider
 from .anthropic import AnthropicProvider
+from .doubao import DoubaoProvider
 from .factory import get_provider
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "HumanQueueProvider",
     "StubProvider",
     "AnthropicProvider",
+    "DoubaoProvider",
     "get_provider",
 ]

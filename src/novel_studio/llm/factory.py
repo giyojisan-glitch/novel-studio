@@ -7,13 +7,14 @@ from .base import BaseProvider
 from .human_queue import HumanQueueProvider
 from .stub import StubProvider
 from .anthropic import AnthropicProvider
+from .doubao import DoubaoProvider
 
 
 def get_provider(name: str | None = None) -> BaseProvider:
     """按名字返回 provider。
 
     - 优先级：函数参数 > 环境变量 NOVEL_STUDIO_PROVIDER > 默认 human_queue
-    - 识别：'human_queue' / 'stub' / 'anthropic'
+    - 识别：'human_queue' / 'stub' / 'anthropic' / 'doubao'
     """
     name = name or os.getenv("NOVEL_STUDIO_PROVIDER", "human_queue")
     name = name.lower()
@@ -24,4 +25,6 @@ def get_provider(name: str | None = None) -> BaseProvider:
         return StubProvider()
     if name == "anthropic":
         return AnthropicProvider()
-    raise ValueError(f"未知 provider: {name}（可选：human_queue / stub / anthropic）")
+    if name == "doubao":
+        return DoubaoProvider()
+    raise ValueError(f"未知 provider: {name}（可选：human_queue / stub / anthropic / doubao）")

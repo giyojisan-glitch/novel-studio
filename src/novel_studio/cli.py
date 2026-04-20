@@ -396,13 +396,13 @@ def main():
                         choices=["strict", "balanced", "creative"],
                         help="创意档位：strict(严格按 premise, temp=0.3) / balanced(默认, temp=0.7) / creative(大胆补全, temp=1.0)")
     p_init.add_argument("--provider", default=None,
-                        help="LLM provider: human_queue (默认) / anthropic / stub")
+                        help="LLM provider: human_queue (默认) / anthropic / doubao / stub")
     p_init.set_defaults(func=cmd_init)
 
     p_step = sub.add_parser("step", help="读响应、推进到下一步")
     p_step.add_argument("project_dir")
     p_step.add_argument("--provider", default=None,
-                        help="LLM provider: human_queue (默认) / anthropic / stub")
+                        help="LLM provider: human_queue (默认) / anthropic / doubao / stub")
     p_step.set_defaults(func=cmd_step)
 
     p_status = sub.add_parser("status", help="查看当前项目进度")
