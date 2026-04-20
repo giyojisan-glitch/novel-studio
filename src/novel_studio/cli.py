@@ -46,6 +46,7 @@ def cmd_init(args):
             genre=args.genre,
             chapter_count=args.chapters,
             target_words_per_chapter=args.words,
+            language=args.language,
             pipeline_version="v2" if args.v2 else "v1",
         )
     )
@@ -283,7 +284,9 @@ def main():
     p_init = sub.add_parser("init", help="新建项目，dump L1 骨架 prompt")
     p_init.add_argument("premise", nargs="?", default=None, help="直接传 premise 字符串（短则 AI 脑补多）")
     p_init.add_argument("--file", "-f", help="从 inputs/ 下的文件读取 premise（推荐，150+ 字）")
-    p_init.add_argument("--genre", default="科幻", choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史"])
+    p_init.add_argument("--genre", default="科幻", choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻"])
+    p_init.add_argument("--language", default="zh", choices=["zh", "ja"],
+                        help="本文输出语言（zh=中文默认，ja=日本語）")
     p_init.add_argument("--chapters", type=int, default=3)
     p_init.add_argument("--words", type=int, default=1000)
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
@@ -316,7 +319,8 @@ def main():
                              help="对单篇短篇跑 TDD 评估（extract→generate→judge）")
     p_bone.add_argument("file", help="原文 markdown 路径")
     p_bone.add_argument("--genre", default="科幻",
-                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史"])
+                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻"])
+    p_bone.add_argument("--language", default="zh", choices=["zh", "ja"])
     p_bone.add_argument("--pipeline", default="v1", choices=["v1", "v2"],
                         help="NOVEL-Studio pipeline 版本（v2 含 L4 润色，更贵）")
     p_bone.set_defaults(func=cmd_benchmark_one)
@@ -325,8 +329,9 @@ def main():
                              help="批量跑 corpus/ 下所有短篇（支持 .md/.txt 递归 + 自动 genre 推断）")
     p_ball.add_argument("corpus_dir", help="放原文的目录（如 benchmarks/corpus）")
     p_ball.add_argument("--genre", default=None,
-                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史"],
+                        choices=["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻"],
                         help="指定 genre（默认按子目录自动推断）")
+    p_ball.add_argument("--language", default="zh", choices=["zh", "ja"])
     p_ball.add_argument("--pipeline", default="v1", choices=["v1", "v2"])
     p_ball.add_argument("--limit", type=int, default=None,
                         help="只跑前 N 篇（试水用）")

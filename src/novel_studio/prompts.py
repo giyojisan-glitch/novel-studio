@@ -103,11 +103,39 @@ def _load_style(genre: str) -> str:
     return text
 
 
-def l3_system_for(genre: str) -> str:
+_LANG_HEADER = {
+    "zh": "",  # default, prompt 本身已是中文
+    "ja": (
+        "🌏 **OUTPUT LANGUAGE: JAPANESE (日本語)**\n"
+        "本指示書は中国語で書かれていますが、**生成される物語本文（content フィールド）は"
+        "日本語で書いてください**。JSON のキー名や revision 等のメタデータは英数字のままで構いません。\n\n"
+    ),
+}
+
+
+# L1/L2 用的轻量级语言头——这些层主要是结构设计（title/summary/events），
+# 本体是日文小说时，title/logline/summary/hook/key_events 等字段也应该用日文写。
+_LANG_HEADER_META = {
+    "zh": "",
+    "ja": (
+        "🌏 **OUTPUT LANGUAGE: JAPANESE (日本語)**\n"
+        "物語のタイトル・ログライン・章概要・キーイベント等はすべて**日本語で記入**してください。"
+        "指示文は中国語ですが、出力されるフィールド値は日本語にしてください。JSON の構造は保持。\n\n"
+    ),
+}
+
+
+def _lang_meta_header(language: str) -> str:
+    return _LANG_HEADER_META.get(language, "")
+
+
+def l3_system_for(genre: str, language: str = "zh") -> str:
     style = _load_style(genre)
+    header = _LANG_HEADER.get(language, "")
+    base = header + L3_SYSTEM_BASE
     if not style:
-        return L3_SYSTEM_BASE
-    return L3_SYSTEM_BASE + "\n\n" + style
+        return base
+    return base + "\n\n" + style
 
 L3_TASK = """## 任务
 写第 {chapter_idx} / {total} 章的正文。
@@ -143,7 +171,7 @@ L3_TASK = """## 任务
 {schema}
 ```
 
-`content` 字段放纯正文文本；`word_count` 是中文字符数（不含标点）；`index` 是 {chapter_idx}；`revision` 是 {revision}。
+`content` 字段放纯正文文本；`word_count` 是文本字符数（中文：汉字数；日文：假名+汉字数；英文：单词数）——不含标点和空白；`index` 是 {chapter_idx}；`revision` 是 {revision}。
 
 ## 🔴 JSON 格式铁律（违反会导致整章作废）
 - **第一个字符必须是 `{{`**；不要 markdown 包裹，不要写任何解释
@@ -217,7 +245,8 @@ def l1_prompt(state: NovelState) -> str:
     ui = state.user_input
     retry = _retry_hint(state, "L1")
     return (
-        L1_SYSTEM.format(chapter_count=ui.chapter_count, words_per_chapter=ui.target_words_per_chapter)
+        _lang_meta_header(ui.language)
+        + L1_SYSTEM.format(chapter_count=ui.chapter_count, words_per_chapter=ui.target_words_per_chapter)
         + "\n\n"
         + L1_TASK.format(
             premise=ui.premise,
@@ -236,7 +265,8 @@ def l2_prompt(state: NovelState, chapter_idx: int) -> str:
     ) or "（这是第一章）"
     retry = _retry_hint(state, f"L2_{chapter_idx}")
     return (
-        L2_SYSTEM
+        _lang_meta_header(state.user_input.language)
+        + L2_SYSTEM
         + "\n\n"
         + L2_TASK.format(
             chapter_idx=chapter_idx,
@@ -259,7 +289,7 @@ def l3_prompt(state: NovelState, chapter_idx: int) -> str:
     retry = _retry_hint(state, f"L3_{chapter_idx}")
     l1 = state.l1
     return (
-        l3_system_for(state.user_input.genre)
+        l3_system_for(state.user_input.genre, state.user_input.language)
         + "\n\n"
         + L3_TASK.format(
             chapter_idx=chapter_idx,

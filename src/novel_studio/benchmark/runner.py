@@ -129,12 +129,18 @@ def run_single(
     (pdir / "queue").mkdir(exist_ok=True)
     (pdir / "responses").mkdir(exist_ok=True)
 
+    # 自动推断语言（日轻/悪役令嬢 子目录 → ja）
+    language = "zh"
+    if corpus_root is not None:
+        language = _infer_language_from_path(original_path, corpus_root, default="zh")
+
     state = NovelState(
         user_input=UserInput(
             premise=premise_text,
             genre=genre,
             chapter_count=chapter_count,
             target_words_per_chapter=1000,
+            language=language,  # type: ignore[arg-type]
             pipeline_version=pipeline_version,  # type: ignore[arg-type]
         )
     )

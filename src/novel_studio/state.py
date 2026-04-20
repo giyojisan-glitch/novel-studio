@@ -4,7 +4,8 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
-Genre = Literal["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史"]
+Genre = Literal["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历史", "日轻"]
+Language = Literal["zh", "ja"]
 Layer = Literal["L1", "L2", "L3", "L4"]
 AuditHead = Literal["logic", "pace", "style", "character"]
 
@@ -14,7 +15,7 @@ class UserInput(BaseModel):
     genre: Genre = "科幻"
     chapter_count: int = Field(3, ge=1, le=10)
     target_words_per_chapter: int = Field(1000, ge=300, le=3000)
-    language: str = "zh"
+    language: Language = "zh"
     # V2: pipeline 版本 —— v1 维持旧行为（L3 → finalize，L4 透传）
     #                    v2 启用新管道（L3 → final_audit → L4_adversarial → L4_scrubber → finalize）
     pipeline_version: Literal["v1", "v2"] = "v1"
