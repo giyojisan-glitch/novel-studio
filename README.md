@@ -79,21 +79,31 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 
 ### What's working
 
-- ✅ L1/L2/L3 layered state machine with checkpointing
+- ✅ L1/L2/L3/**L4** layered state machine with checkpointing (V2: adversarial edit + scrubber)
 - ✅ Multi-head audit (2 heads: logic + pace) with parallel dispatch and vote-based aggregation
+- ✅ **Final-stage audit**: whole-book review against premise (catches timeline contradictions, dropped foreshadows, collapsed characters)
 - ✅ Retry gates with force-pass after 2 rounds
 - ✅ Cross-attention-style layered prompting
 - ✅ Style packs as editable markdown files (not hardcoded)
+- ✅ **Creativity parameter** (`strict` / `balanced` / `creative`) — routes both temperature (0.3/0.7/1.0) and prompt constraints per run
+- ✅ **Three LLM providers**: `human_queue` (Claude session responds), `anthropic` (Claude API), `doubao` (volcengine Coding Plan)
+- ✅ **Lora-style Inspiration RAG**: `inspirations/{author}/*.txt` → BAAI/bge-large-zh-v1.5 embeddings → Chroma → auto-injected into L3 prompts as style references. See [`docs/TRAINING_METHODOLOGY.md`](docs/TRAINING_METHODOLOGY.md) for A/B validation results.
 - ✅ Artifacts export (every layer's output is human-readable)
-- ✅ CLI with init/step/status/artifacts commands
+- ✅ CLI with init/step/status/artifacts/inspire commands
+- ✅ 126 unit tests green
+
+### A/B validated signals (see `docs/TRAINING_METHODOLOGY.md`)
+
+- Inspiration RAG produces **15-40% style shift** toward the seeded author (stronger on models with heavier default biases — larger correction room)
+- Multi-author semantic routing: **27/30 = 90% correct** author retrieval even at 10:1 corpus imbalance
 
 ### What's missing (and why it's hard)
 
-1. **API-based LLM provider.** The current `HumanQueue` provider requires a human (or Claude session) to write responses. Adding an `AnthropicProvider` / `OpenAIProvider` is maybe 100 lines — but making the prompts reliable against unsupervised LLMs is harder.
-2. **Only 2 audit heads.** The original design has 4 (add character consistency + style). More critically: **no final-stage audit** reviews the whole book against the original premise, so cross-layer bugs (timeline contradictions, dropped foreshadows, minor characters collapsing) slip through. My three demos all had these.
-3. **Chapters are still sequential.** True parallel generation with shared blackboard state + a negotiation round is V3.
-4. **No inspiration library.** The "Lora-style" style packs are static descriptions. True RAG-based style transfer — feed the AI your favorite novels and generate in that voice — is unbuilt.
-5. **Chinese-first.** Prompts and style packs are in Mandarin. Architecture is language-agnostic; porting is a translation task.
+1. **Only 2 audit heads.** The original design has 4 (add character consistency + style).
+2. **Chapters are still sequential.** True parallel generation with shared blackboard state + a negotiation round is V3.
+3. **Long-form (novel-length) support.** Current stable output is 3-5 chapters × 1500-2500 words. Longer needs chapter negotiation + world bible.
+4. **Chinese-first.** Prompts and style packs are in Mandarin. Architecture is language-agnostic; porting is a translation task.
+5. **UX rough edges**: `step` doesn't remember the `--provider` chosen at `init`, must be passed each call.
 
 ---
 
@@ -120,50 +130,89 @@ I'll respond to every message. If you want to fork and go solo, that's fine too 
 
 ```
 novel-studio/
-├── src/novel_studio/          # MVP Python implementation (~900 LoC)
+├── src/novel_studio/
 │   ├── state.py               # Pydantic schemas for all layers
-│   ├── prompts.py             # Prompt templates (L1/L2/L3/audit)
+│   ├── prompts.py             # Prompt templates (L1/L2/L3/L4/audit) + RAG injection
 │   ├── engine.py              # Step engine: advance / retry / apply
 │   ├── audit.py               # Multi-head audit aggregator
-│   ├── cli.py                 # novel-studio init/step/status/artifacts
-│   └── utils.py               # File IO, artifact rendering
+│   ├── cli.py                 # novel-studio init/step/status/artifacts/inspire
+│   ├── llm/                   # LLM Provider abstractions
+│   │   ├── human_queue.py     # Claude session as LLM (free, slow)
+│   │   ├── anthropic.py       # Claude API (paid, fast)
+│   │   ├── doubao.py          # Volcengine Coding Plan (subscription)
+│   │   └── stub.py            # Deterministic fixtures for tests
+│   ├── inspiration/           # Lora-style RAG
+│   │   ├── ingester.py        # .txt → chunks → BAAI embeddings → Chroma
+│   │   └── retriever.py       # Query-time top-k retrieval with filters
+│   └── utils.py
 ├── styles/                    # Genre style packs (editable .md)
-│   ├── 科幻.md / 仙侠.md / ...  # Chinese; each defines voice for a genre
-│   └── _README.md
+│   └── 科幻.md / 武侠.md / 志怪.md / 日轻.md / ...
+├── inspirations/              # Lora training data (gitignored — copyright)
+│   └── {作家}/*.txt           # Seed author's works here
 ├── inputs/                    # Premise input files
-│   ├── _TEMPLATE.md           # How to write a good premise
-│   └── _EXAMPLE_xianxia.md    # Worked example
+│   └── _TEMPLATE.md
+├── chroma_db/                 # Vector store (gitignored)
 ├── docs/
-│   ├── ARCHITECTURE.md        # Detailed design reasoning
-│   └── ROADMAP.md             # V2/V3/V4 planned improvements
-└── README.md (this file)
+│   ├── ARCHITECTURE.md
+│   ├── TRAINING_METHODOLOGY.md  # ★ Experiment design + A/B validation results
+│   ├── INSPIRATION_MAP.md
+│   └── ROADMAP.md
+└── tests/                     # 126 tests
 ```
 
-Runtime directories (`projects/`, `outputs/`, `artifacts/`) are gitignored — they contain generated content.
+Runtime directories (`projects/`, `outputs/`, `artifacts/`, `chroma_db/`, `inspirations/{author}/`) are gitignored — they contain generated content or copyrighted source material.
 
 ---
 
 ## Trying the MVP
 
-> **Caveat:** Currently only runs inside a Claude Code session, because the LLM provider is human-in-the-loop.
-
 ```bash
 # Install
 uv sync
 
+# Put your API key in .env (gitignored):
+#   ANTHROPIC_API_KEY=sk-ant-...          OR
+#   DOUBAO_API_KEY=...                    (volcengine Coding Plan subscription)
+
 # Write a premise file in inputs/ (150+ chars, see _TEMPLATE.md)
-# Then initialize a project
-uv run novel-studio init --file inputs/my_premise.md --genre 仙侠 --chapters 3
 
-# The engine dumps prompts to projects/{timestamp}/queue/
-# In a Claude Code session, respond to each prompt by writing JSON to responses/
-# Then advance:
-uv run novel-studio step projects/{timestamp}/
+# Run with Claude API (auto, fast)
+uv run novel-studio init --file inputs/my_premise.md \
+    --genre 武侠 --chapters 3 --words 2000 \
+    --creativity balanced --provider anthropic --v2
 
-# Loop until DONE. Final novel appears in outputs/
+# Or run with Doubao (volcengine subscription)
+uv run novel-studio init --file inputs/my_premise.md \
+    --genre 武侠 --chapters 3 --words 2000 \
+    --creativity balanced --provider doubao --v2
+
+# Or run free via Claude Code session (human_queue: you respond to prompts)
+uv run novel-studio init --file inputs/my_premise.md --genre 武侠 --chapters 3
+
+# Advance (for auto providers one call per stage):
+uv run novel-studio step projects/{timestamp}/ --provider doubao
+# Loop until 🎉 完成. Final novel in outputs/
 ```
 
-If you want a truly autonomous version: implement a real `LLMProvider` in `src/novel_studio/llm/` (replace `HumanQueue` with `AnthropicProvider` / `OpenAIProvider` / `LocalLlamaProvider`) and send a PR. That's roughly the V2 milestone.
+### Seed the inspiration library (Lora-style style transfer)
+
+```bash
+# Put your favorite author's short stories here
+mkdir -p inspirations/温瑞安
+cp path/to/*.txt inspirations/温瑞安/
+
+# Ingest (first time downloads BAAI/bge-large-zh-v1.5 ~1GB)
+uv run novel-studio inspire ingest
+
+# Verify library contents + test retrieval
+uv run novel-studio inspire list
+uv run novel-studio inspire query "剑光寒如雪" --top 3
+
+# Now any L3 generation auto-injects style references.
+# To verify with A/B: run once with RAG on, once with NOVEL_STUDIO_NO_RAG=1 to compare.
+```
+
+See [`docs/TRAINING_METHODOLOGY.md`](docs/TRAINING_METHODOLOGY.md) for the full A/B validation methodology and results.
 
 ---
 
