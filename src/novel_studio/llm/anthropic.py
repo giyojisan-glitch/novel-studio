@@ -4,9 +4,10 @@
 - **Output-compatible with HumanQueue**: 响应写到 `pdir/responses/{step_id}.response.json`
   这样 engine 层不用区分两种 provider（都是 file-based），并且支持**断点续跑**（重跑 init 时
   已有响应不会重调 API）
-- **2 层重试**：
+- **3 层重试**：
   1. API 错误（rate limit / 5xx / timeout）→ exponential backoff，3 次
-  2. JSON 解析失败（LLM 包 markdown、截断、乱加解释）→ 追加提示重试，2 次
+  2. JSON 解析失败 → json5 lenient fallback
+  3. 仍解析失败 + content-heavy step（L3/L4_scrubber）→ raw text 兜底包装
 - **环境变量**：
   - `ANTHROPIC_API_KEY`（必需）
   - `NOVEL_STUDIO_MODEL`（可选，默认 `claude-sonnet-4-6`）
@@ -52,6 +53,7 @@ class AnthropicProvider(BaseProvider):
         self.max_api_retries = max_api_retries
         self.max_json_retries = max_json_retries
         self._client = None  # lazy init
+        self._last_raw_text: str = ""  # 最后一次 API 返回的 raw text（兜底用）
 
     @property
     def client(self):
@@ -68,19 +70,25 @@ class AnthropicProvider(BaseProvider):
     def request(self, step_id: str, prompt: str, pdir: Path) -> None:
         """调 API 拿响应、写到 responses/{step_id}.response.json。
 
-        如果响应文件已存在（断点续跑场景），直接跳过，不重复调用。
+        断点续跑：response 已存在直接 skip。
+        Raw-text 兜底：JSON 全失败时，content-heavy step（L3/L4_scrubber）把 raw text
+        包装成最小合法 JSON，避免一次 LLM 偷懒废掉整本书。
         """
         resp_path = pdir / "responses" / f"{step_id}.response.json"
         if resp_path.exists():
-            return  # 断点续跑：已有响应不重调
+            return  # 断点续跑
 
-        # 同时把 prompt 写到 queue/ 便于调试与观察（和 HumanQueue 一致）
         write_prompt(pdir, step_id, prompt)
 
-        # 真调 API + 2 层重试
-        data = self._call_with_retries(prompt)
+        try:
+            data = self._call_with_retries(prompt)
+        except RuntimeError:
+            # 兜底：content-heavy step 接受 raw text 包装
+            if _is_content_heavy_step(step_id) and self._last_raw_text:
+                data = _wrap_raw_text_as_json(step_id, self._last_raw_text)
+            else:
+                raise
 
-        # 写到 response 文件
         resp_path.parent.mkdir(parents=True, exist_ok=True)
         resp_path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
@@ -101,7 +109,6 @@ class AnthropicProvider(BaseProvider):
         return ProviderResult(ready=True, data=data)
 
     def reset(self, step_id: str, pdir: Path) -> None:
-        """清理指定 step 的文件，让下次 request 重新调 API。"""
         for sub, suffix in (("queue", ".prompt.md"), ("responses", ".response.json")):
             p = pdir / sub / f"{step_id}{suffix}"
             if p.exists():
@@ -110,10 +117,7 @@ class AnthropicProvider(BaseProvider):
     # -------- 内部：真正的 API 调用 + 重试 --------
 
     def _call_with_retries(self, prompt: str) -> Any:
-        """两层重试：JSON 解析失败 → 带 hint 重调；API 错误 → 指数退避。
-
-        返回值：解析好的 dict 或 list（L4_adversarial 是 list）。
-        """
+        """JSON 重试：先尝试 strict，失败用 json5 lenient，再失败带 hint 重发。"""
         current_prompt = prompt
         last_error: Exception | None = None
 
@@ -123,12 +127,12 @@ class AnthropicProvider(BaseProvider):
                 return self._parse_json(raw_text)
             except (json.JSONDecodeError, ValueError) as e:
                 last_error = e
-                # 追加错误提示，让 LLM 下次规范输出
                 current_prompt = (
                     prompt
                     + "\n\n【系统反馈】上一次响应不是合法 JSON："
                     + f"{str(e)[:150]}\n"
-                    + "请只输出严格的 JSON，不要 markdown 代码块包裹，不要解释文字。"
+                    + "请只输出严格的 JSON。第一个字符必须是 `{` 或 `[`。"
+                    + "不要 markdown 包裹，不要解释文字，不要直接写正文——必须是 JSON 对象。"
                 )
 
         raise RuntimeError(
@@ -136,7 +140,6 @@ class AnthropicProvider(BaseProvider):
         )
 
     def _call_api_with_backoff(self, prompt: str) -> str:
-        """调 API；遇到 rate limit / 5xx / timeout 指数退避重试。"""
         import anthropic
 
         for api_attempt in range(self.max_api_retries):
@@ -146,12 +149,13 @@ class AnthropicProvider(BaseProvider):
                     max_tokens=self.max_tokens,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                # content 是 list，通常只有一个 TextBlock
-                return "".join(
+                text = "".join(
                     getattr(block, "text", "")
                     for block in msg.content
                     if getattr(block, "type", "") == "text"
                 )
+                self._last_raw_text = text  # 兜底用
+                return text
             except (
                 anthropic.APIStatusError,
                 anthropic.APIConnectionError,
@@ -161,17 +165,60 @@ class AnthropicProvider(BaseProvider):
                     raise RuntimeError(
                         f"Anthropic API 调用重试 {self.max_api_retries} 次仍失败：{e}"
                     ) from e
-                # 指数退避：1s, 2s, 4s
                 time.sleep(2 ** api_attempt)
 
-        raise RuntimeError("unreachable")  # for type checker
+        raise RuntimeError("unreachable")
 
     @staticmethod
     def _parse_json(text: str) -> Any:
-        """剥离 markdown 包裹，然后 json.loads。失败时 raise 让上层处理。"""
+        """剥离 markdown 包裹，解析 JSON（用 json5 兜 lenient）。"""
         text = text.strip()
-        # 剥离开头 ```json / ``` 和结尾 ```
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         text = text.strip()
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            import json5
+            return json5.loads(text)
+
+
+# ============================================================
+# Raw-text 兜底辅助：避免 LLM 偷懒返纯小说时整本书废掉
+# ============================================================
+
+
+_L3_CHAPTER_EXACT = re.compile(r"^L3_\d+$")
+_L4_SCRUBBER_EXACT = re.compile(r"^L4_scrubber_\d+$")
+
+
+def _is_content_heavy_step(step_id: str) -> bool:
+    """content-heavy = LLM 极易返纯文本不裹 JSON 的 step（章节正文/润色）。
+
+    严格匹配：排除 L3_N_audit_logic 这类后缀 step。
+    """
+    return bool(_L3_CHAPTER_EXACT.match(step_id) or _L4_SCRUBBER_EXACT.match(step_id))
+
+
+def _wrap_raw_text_as_json(step_id: str, raw_text: str) -> dict:
+    """把 LLM 偷懒返回的纯文本包装成对应 step 的最小合法 JSON。"""
+    cn_count = len(re.findall(r"[\u4e00-\u9fff]", raw_text))
+
+    if step_id.startswith("L3_"):
+        idx = int(step_id.split("_")[1])
+        return {
+            "index": idx,
+            "content": raw_text,
+            "word_count": cn_count,
+            "revision": 0,
+        }
+    if step_id.startswith("L4_scrubber_"):
+        idx = int(step_id.split("_")[2])
+        return {
+            "index": idx,
+            "content": raw_text,
+            "polish_notes": ["raw text fallback (LLM 未返回结构化响应)"],
+            "adversarial_cuts": [],
+            "revision": 0,
+        }
+    return {}
