@@ -89,9 +89,10 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 - ✅ **Three LLM providers**: `human_queue` (Claude session responds), `anthropic` (Claude API), `doubao` (volcengine Coding Plan)
 - ✅ **Lora-style Inspiration RAG**: `inspirations/{author}/*.txt` → BAAI/bge-large-zh-v1.5 embeddings → Chroma → auto-injected into L3 prompts as style references. See [`docs/TRAINING_METHODOLOGY.md`](docs/TRAINING_METHODOLOGY.md) for A/B validation results.
 - ✅ **V3 long-form pipeline** (`--pipeline v3`): interleaved L2/L3 (each chapter outline sees the real prose of prior chapters) + **WorldBible** (per-chapter `bible_update` extracts new characters, facts, timeline events, and foreshadow state; bible is injected as context into subsequent L2/L3 prompts). Supports up to 30 chapters.
+- ✅ **V4 scene decomposition + multi-scale continuity** (`--pipeline v4`): adds an L2.5 layer that breaks each chapter into 3-5 scenes with explicit opening/closing beats. L3 writes scene-by-scene; each scene prompt sees a CNN-style **multi-scale context** (last 400 chars of prev scene at high resolution, prior scene beats at mid resolution, last 3 chapters' closing at low resolution) + an **anti-cold-open hard constraint** that forbids chapter-restart templates ("指节攥得发白"). New **continuity audit head** (alongside logic + pace) scores cross-scene/cross-chapter handoff. L2 prompts now actually see the 800-char tail of the previous chapter's last scene (V3's half-kept interleaved promise finally fulfilled).
 - ✅ Artifacts export (every layer's output is human-readable)
 - ✅ CLI with init/step/status/artifacts/inspire commands
-- ✅ 135 unit tests green
+- ✅ 182 unit tests green
 
 ### A/B validated signals (see `docs/TRAINING_METHODOLOGY.md`)
 
@@ -101,9 +102,9 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 
 ### What's missing (and why it's hard)
 
-1. **Only 2 audit heads.** The original design has 4 (add character consistency + style).
-2. **V3 not yet battle-tested on real LLM at 10+ chapters.** Schema + routing + interleaving pass all stub tests; real-model 10-chapter run is the next empirical check.
-3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3 bible work and would stack on top.
+1. **3 audit heads (logic + pace + continuity for V4).** Still missing character-consistency and style heads that the original design called for.
+2. **V4 not yet battle-tested on real LLM.** Full stack (schema + engine + prompts + audit + artifacts) passes all 182 stub tests; a real-model validation run (5-10 chapters with Doubao) is the next empirical check.
+3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3/V4 work.
 4. **Chinese-first.** Prompts and style packs are in Mandarin. Architecture is language-agnostic; porting is a translation task.
 5. **UX rough edges**: `step` doesn't remember the `--provider` chosen at `init`, must be passed each call.
 
@@ -196,6 +197,13 @@ uv run novel-studio init --file inputs/my_novel.md \
     --genre 志怪 --chapters 10 --words 1500 \
     --provider doubao --pipeline v3
 
+# V4 recommended for long-form (adds L2.5 scene decomposition +
+# multi-scale context + continuity audit). --scenes-per-chapter is a
+# soft target (LLM picks final count in 3-5 range).
+uv run novel-studio init --file inputs/my_novel.md \
+    --genre 志怪 --chapters 10 --words 1500 \
+    --provider doubao --pipeline v4 --scenes-per-chapter 4
+
 # Advance (for auto providers one call per stage):
 uv run novel-studio step projects/{timestamp}/ --provider doubao
 # Loop until 🎉 完成. Final novel in outputs/
@@ -222,6 +230,39 @@ L1  skeleton
 **Why this beats sequential chains:** at chapter 7, L3 prompt sees a structured account of every character's current arc state, which rules are in force, which foreshadows still need paying off, and what actually happened in each prior chapter (not just outlines). Characters stop drifting; rules stop contradicting; foreshadow paying becomes explicit rather than accidental.
 
 The bible is append-only: each `bible_update_i` emits increments (`new_characters`, `character_updates`, `paid_foreshadow`, etc.), merged deterministically into state. You can inspect it at any time in `projects/{slug}/state.json` → `world_bible`.
+
+### V4 scene decomposition + multi-scale continuity
+
+V3 got characters and rules under control but couldn't stop each chapter from starting as if it were Chapter 1 again — every opening resorted to "沈砚指节攥得发白" / "沈砚喉结滚动" because L3's only window into prior prose was 150 chars. V4 addresses this directly:
+
+```
+L2_i outline (now sees 800 chars of ch_{i-1}'s final scene, not just summary)
+ └── L2_i audit
+L2.5_i scene list        (new layer: 3-5 SceneOutlines with opening_beat /
+ └── L2.5_i audit          closing_beat / dominant_motifs / target_words)
+for scene s in 1..M_i:
+  L3_{i,s} prose         (sees multi-scale context:
+                            · scene level: prev scene's tail 400 chars
+                            · chapter level: all prior scene beats this chapter
+                            · book level: last 3 chapters' closing 100 chars
+                          + hard anti-cold-open constraint:
+                          "严禁以『X 指节攥得发白』作为场景第一句")
+L3_i chapter audit       (3 heads: logic + pace + **continuity**)
+                          continuity head specifically checks:
+                          - chapter opening actually continues prev chapter closing
+                          - scene transitions use concrete objects/time/action
+                          - shared motifs stay consistent across scenes
+                          - no 2+ recurring "template" openers per chapter
+bible_update_i           (same as V3)
+```
+
+**CNN analogy**: V3 was effectively a 1-layer conv with a tiny kernel (150-char receptive field), so long-range info couldn't flow. V4 stacks receptive fields at three resolutions — the scene-level window gives rhythm carry-over, the chapter-level beats prevent rhythm repetition, and the book-level closings keep the whole arc in view. Like U-Net skip-connections: each layer gets info at the resolution where it's useful.
+
+**Interleaved promise now actually kept**: V3 scheduled `L2_i → L3_i → L2_{i+1}` but L2_{i+1}'s prompt still only read summaries, not prose. V4's l2_prompt injects 800 chars of the previous chapter's last scene content directly.
+
+Artifacts produced (all human-readable):
+- `artifacts/{slug}/07_scene_lists.md` — the L2.5 per-chapter scene design
+- `artifacts/{slug}/08_scene_cards.md` — design vs actual comparison (what LLM wrote vs what was planned)
 
 ### Seed the inspiration library (Lora-style style transfer)
 

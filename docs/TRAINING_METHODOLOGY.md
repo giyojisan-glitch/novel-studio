@@ -5,9 +5,9 @@
 
 ---
 
-## 1. 核心思路（四层创新）
+## 1. 核心思路（五层创新）
 
-对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在四个维度：
+对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在五个维度：
 
 ### 1.1 多层状态机（对标扩散模型）
 
@@ -102,6 +102,63 @@ L1 骨架 → L1_audit → bible_init（synthetic，从 L1 抽出初始 bible）
 **状态持久化**：`projects/{slug}/state.json` → `world_bible` 字段记录完整 bible，随时可查、可手动编辑、可作为 debug 入口（如果某章角色跑偏，查 bible 就能定位是 character_updates 错了还是 L3 脱缰）。
 
 **当前状态**（2026-04-21）：schema + 路由 + interleaved engine + stub smoke test 全绿，135 tests pass。真 LLM 10 章 run 是下一步的验证目标（预估 Doubao 一次跑完 40-50 分钟）。
+
+### 1.5 V4 场景分解层 + 多尺度连续性（CNN 式感受野）
+
+**V3 跑了一次 Doubao 8 章真 LLM 后，发现的问题**：bible 把角色和规则锁住了（沈砚的眉骨旧疤、三枚铜钱这些细节 8 章一字不差），但**章节间的节奏断裂**依然严重——每章都以类似「沈砚指节攥得发白」这种重启句开头，LLM 是在**冷启动**写每一章，不是在**续写**。
+
+**根因**：V3 的 L3 prompt 对前文只有两个抓手：
+- `prev_tail` 150 字（字符级感受野太小，接不住节奏）
+- 抽象 bible（状态快照，丢失了散文的**腔调/物件/节律**）
+
+**类比 CNN**：V3 等于一个 1 层卷积，kernel 只 3×3，大图里远端像素根本传不到眼前。想要全局连贯，得**堆叠多尺度感受野**。
+
+**V4 架构**：
+```
+L2_i (章节梗概)     ⟵ 新增：上一章最后场景正文 800 字（兑现 V3 interleaved 承诺）
+  └─ audit
+L2.5_i (场景列表)   ⟵ 新层！把章节拆成 3-5 个场景
+  └─ audit             每场景有 opening_beat / closing_beat / purpose / motifs / target_words
+  │                   转场说明 transition_notes 显式写明「场景 1→2 用物件过渡」
+  ↓
+for scene s in 1..M_i:
+  L3_{i,s} (单场景正文) ⟵ 多尺度 context 注入：
+                          · 场景层（高分辨率 400 字）：上一场景全文尾段
+                          · 章节层（中分辨率）：本章已写场景的 opening/closing 一行
+                          · 全书层（低分辨率）：前 3 章的收束 100 字 × 3
+                        + anti-cold-open 硬约束：
+                          「严禁『指节攥得发白』『喉结滚动』作场景首句」
+                          「开场从上一场景末的具体动作/物件/对白直接往下演」
+  ↓
+L3_i chapter_audit (3 头 = logic + pace + continuity) ⟵ 新 head！
+  continuity 头专审：
+    - 本章开场承接上一章末？
+    - 场景间转场自然（物件/时间/动作）？
+    - 共同物件描述一致？
+    - 角色情绪连续推进？
+    - 有无 > 2 次模板化重复？
+  ↓
+bible_update_i → 下一章 L2 → ...
+```
+
+**关键设计决策**：
+
+1. **滚动生成（rolling decode）而非批量生成**：V4 坚持"写完第 s 场景立即更新 SceneCard，第 s+1 场景立即看到 s 的实际 prose"。类比 RNN 的 hidden state 从 t 传给 t+1——而不是等全章写完再 audit，错过了场景间修正机会。
+
+2. **感受野 = 真实 prose 而不是 summary**：bible 是"状态"，SceneCard 里的 `actual_opening` / `actual_closing` 是"风格样本"。两者互补——bible 告诉你"是什么"，actual 片段告诉你"怎么写"。
+
+3. **anti-cold-open 用禁令而不是鼓励**：LLM 对正向 prompt「要连贯」响应弱；对具体禁令（「严禁这 4 种开头」）响应强。类比 negative prompt 在 diffusion 里的效用。
+
+4. **continuity 独立成头**：不把"承接"丢给 logic 头混审。logic 关心"行为合理"，continuity 关心"跨场景是否一次写完的感觉"——不同 axis，必须分开打分。
+
+5. **章节内场景数软目标**：`scenes_per_chapter_hint=4` 是软的，LLM 在 3-5 范围自选。给它选择权，因为动作章和过渡章的自然切分方式不同。
+
+**增加的 LLM 调用**：
+- V3 10 章 ≈ 73 次调用
+- V4 10 章 ≈ 10×(1 L2 + 2 L2_audit + 1 L2.5 + 2 L2.5_audit + 4 scenes + 3 chapter_audit + 1 bible_update) + 1 L1 + 2 L1_audit + 1 final_audit + 20 L4 = **~153 次调用**（+110%）
+- 换来的是**真正可读的长篇**（前面 8 章 Doubao run 写得再好，节奏断裂就是不能上）
+
+**当前状态**（2026-04-21）：V4 五个 commit 已落地。Schema + engine + prompts + audit head + artifacts + CLI + 179 tests 全绿。真 LLM 5 章验证是下一步（预估 ~30 min，~70 调用）。
 
 ---
 

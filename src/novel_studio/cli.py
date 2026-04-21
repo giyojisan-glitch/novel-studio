@@ -59,6 +59,7 @@ def cmd_init(args):
             language=args.language,
             creativity=args.creativity,
             pipeline_version=pipeline,
+            scenes_per_chapter_hint=args.scenes_per_chapter,
         )
     )
     save_state(pdir, state)
@@ -67,12 +68,14 @@ def cmd_init(args):
     provider = get_provider(args.provider)
     result = advance(state, pdir, provider=provider)
 
+    v4_note = f"\n🎬 每章场景数：[bold]{args.scenes_per_chapter}[/]（V4 L2.5 软目标）" if pipeline == "v4" else ""
     console.print(Panel.fit(
         f"[bold cyan]NOVEL-Studio[/] 项目已创建\n\n"
         f"📁 [yellow]{pdir}[/]\n"
         f"📖 前提：{args.premise}\n"
         f"🎭 类型：{args.genre} · 章节数：{args.chapters} · 每章 {args.words} 字\n"
-        f"🎚 创意档位：[bold]{args.creativity}[/] · pipeline：[bold]{pipeline}[/]\n",
+        f"🎚 创意档位：[bold]{args.creativity}[/] · pipeline：[bold]{pipeline}[/]"
+        f"{v4_note}\n",
         title="✓ init"
     ))
     _print_status(state, pdir, result)
@@ -394,9 +397,12 @@ def main():
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
     p_init.add_argument("--v2", action="store_true",
                         help="[legacy] 等价于 --pipeline v2")
-    p_init.add_argument("--pipeline", default=None, choices=["v1", "v2", "v3"],
-                        help="pipeline 版本：v1（默认，基础） / v2（+final_audit+L4 润色） / "
-                             "v3（+长篇 WorldBible+interleaved L2/L3，支持到 30 章）")
+    p_init.add_argument("--pipeline", default=None, choices=["v1", "v2", "v3", "v4"],
+                        help="pipeline 版本：v1（基础） / v2（+final_audit+L4 润色） / "
+                             "v3（+长篇 WorldBible+interleaved L2/L3） / "
+                             "v4（+L2.5 场景分解+多尺度 context+continuity 审头，推荐长篇）")
+    p_init.add_argument("--scenes-per-chapter", type=int, default=4,
+                        help="V4 专用：每章场景数软目标（默认 4，LLM 可在 3-5 范围浮动）")
     p_init.add_argument("--creativity", default="balanced",
                         choices=["strict", "balanced", "creative"],
                         help="创意档位：strict(严格按 premise, temp=0.3) / balanced(默认, temp=0.7) / creative(大胆补全, temp=1.0)")
