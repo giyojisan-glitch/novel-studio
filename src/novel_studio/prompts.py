@@ -301,14 +301,35 @@ def l2_prompt(state: NovelState, chapter_idx: int) -> str:
         f"- 第{c.index}章《{c.title}》：{c.summary}" for c in state.l2 if c.index < chapter_idx
     ) or "（这是第一章）"
     retry = _retry_hint(state, f"L2_{chapter_idx}")
-    # V3: 如果启用了 bible（v3 pipeline），把跨章真相账本注入
-    bible_block = _bible_context_block(state.world_bible, "L2") if _v3_active(state) else ""
+    # V3/V4: 如果启用了 bible，把跨章真相账本注入
+    pv = state.user_input.pipeline_version
+    use_bible = pv in ("v3", "v4")
+    bible_block = _bible_context_block(state.world_bible, "L2") if use_bible else ""
     final_audit_block = _final_audit_retry_block(state)
+
+    # V4: 兑现 interleaved 承诺——注入上一章最后场景 closing 800 字
+    prev_chapter_tail = ""
+    if pv == "v4" and chapter_idx > 1:
+        prior = _prior_chapter_last_scenes(state, chapter_idx, n=1)
+        if prior and prior[-1].actual_closing:
+            # SceneCard.actual_closing 只存了最后 200 字，但 l3_scenes 有全文
+            last_ch_scenes = sorted(
+                [s for s in state.l3_scenes if s.chapter_index == chapter_idx - 1],
+                key=lambda s: s.scene_index,
+            )
+            if last_ch_scenes:
+                full_tail = last_ch_scenes[-1].content[-800:]
+                prev_chapter_tail = (
+                    f"\n\n## 📖 上一章最后场景结尾（本章梗概必须与此自然承接，而不是重启人物）\n"
+                    f"```\n{full_tail}\n```"
+                )
+
     return (
         _CREATIVITY_HEADER.get(state.user_input.creativity, "")
         + _lang_meta_header(state.user_input.language)
         + L2_SYSTEM
         + bible_block
+        + prev_chapter_tail
         + final_audit_block
         + "\n\n"
         + L2_TASK.format(
@@ -1010,37 +1031,381 @@ def scrubber_prompt(state: NovelState, chapter_idx: int) -> str:
 
 
 # ============ V4: 场景分解层 + 多尺度连续性 ============
-# 本 commit 只落占位 prompt，让 stub 端到端能跑通；真实中文 prompt 在下个 commit。
+
+# ---- V4 helpers：多尺度 context 渲染（CNN 式） ----
+
+def _find_prev_scene(state: NovelState, chapter_idx: int, scene_idx: int) -> L3SceneDraft | None:
+    """找"上一场景"：同章的 scene_idx-1；如果 scene_idx=1，找上一章最后一个场景。"""
+    if scene_idx > 1:
+        prev = [s for s in state.l3_scenes
+                if s.chapter_index == chapter_idx and s.scene_index == scene_idx - 1]
+        return prev[0] if prev else None
+    if chapter_idx > 1:
+        prev_ch_scenes = sorted(
+            [s for s in state.l3_scenes if s.chapter_index == chapter_idx - 1],
+            key=lambda s: s.scene_index,
+        )
+        return prev_ch_scenes[-1] if prev_ch_scenes else None
+    return None
+
+
+def _prior_chapter_last_scenes(state: NovelState, chapter_idx: int, n: int = 3) -> list[SceneCard]:
+    """取 chapter_idx 之前最近 n 章的最后一条 SceneCard。"""
+    out: list[SceneCard] = []
+    for ci in range(chapter_idx - 1, 0, -1):
+        cards = sorted(
+            [c for c in state.scene_cards if c.chapter_index == ci],
+            key=lambda c: c.scene_index,
+        )
+        if cards:
+            out.append(cards[-1])
+        if len(out) >= n:
+            break
+    return list(reversed(out))   # 正序（老的在前）
+
+
+def _scene_multi_scale_context(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
+    """CNN 式多尺度上下文：
+    - 场景层（最高分辨率）：上一场景全文尾段 400 字
+    - 章节层（中分辨率）：本章已写场景的 opening+closing 摘要
+    - 全书层（低分辨率）：前 N 章的最后一个场景 closing 100 字
+    让 LLM 在不同时间尺度上都能锚定节奏。
+    """
+    blocks: list[str] = []
+
+    # —— 场景层：上一场景结尾 400 字（跨场景或跨章节）——
+    prev_scene = _find_prev_scene(state, chapter_idx, scene_idx)
+    if prev_scene:
+        scope = "同章上一场景" if scene_idx > 1 else "上一章最后一场景"
+        blocks.append(
+            f"### 🔍 上一场景结尾（紧接这里开始写，**不得重启人物动作**）· {scope}\n"
+            f"```\n{prev_scene.content[-400:]}\n```"
+        )
+
+    # —— 章节层：本章已写场景的节奏汇总 ——
+    within_chapter = sorted(
+        [s for s in state.l3_scenes
+         if s.chapter_index == chapter_idx and s.scene_index < scene_idx],
+        key=lambda s: s.scene_index,
+    )
+    if within_chapter:
+        lines = []
+        for s in within_chapter:
+            head_snip = s.content[:60].replace("\n", " ")
+            tail_snip = s.content[-60:].replace("\n", " ")
+            lines.append(f"- 场景 {s.scene_index}：开『{head_snip}...』落『...{tail_snip}』")
+        blocks.append("### 📊 本章前面场景节奏（避免重复同样的开场/落点套路）\n" + "\n".join(lines))
+
+    # —— 全书层：前几章的收束 ——
+    prior = _prior_chapter_last_scenes(state, chapter_idx, n=3)
+    if prior:
+        lines = [
+            f"- 第 {sc.chapter_index} 章收束：「{sc.actual_closing[:100]}」"
+            for sc in prior if sc.actual_closing
+        ]
+        if lines:
+            blocks.append("### 🌐 前面章节的收束画面（全书尺度参考，不要复制）\n" + "\n".join(lines))
+
+    if not blocks:
+        return ""
+    return "\n\n## 🎞️ 多尺度历史窗口\n\n" + "\n\n".join(blocks)
+
+
+def _scene_card_block(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
+    """渲染本场景的 SceneOutline 设计。"""
+    sl = next(x for x in state.scene_lists if x.chapter_index == chapter_idx)
+    outline = next(s for s in sl.scenes if s.index == scene_idx)
+    motifs = "、".join(outline.dominant_motifs) if outline.dominant_motifs else "（由你挑）"
+    total_scenes = len(sl.scenes)
+    return (
+        f"\n\n## 🎬 本场景设计（L2.5 产出 · 场景 {scene_idx}/{total_scenes}）\n"
+        f"- **目的**：{outline.purpose}\n"
+        f"- **开场落点**：{outline.opening_beat}\n"
+        f"- **结尾落点**：{outline.closing_beat}\n"
+        f"- **核心意象/物件**：{motifs}\n"
+        f"- **视角**：{outline.pov or '继承上一场景'}\n"
+        f"- **目标字数**：{outline.approximate_words} 字（±20%）"
+    )
+
+
+# ---- V4 真实 prompt 模板 ----
+
+L25_SYSTEM = """你是章节节奏设计师。你的任务不是写正文，是把 L2 梗概**拆成 3-5 个场景**，
+让每个场景都有清晰的**开场落点**和**结尾落点**，场景之间有**明确转场逻辑**。
+
+关键原则：
+- 每个场景只承担一件事：一次对话 / 一次回忆 / 一次行动 / 一次转折。别把两件事塞一个场景。
+- 第 1 场景必须**承接上一章末的画面或动作**（如果有上一章）。
+- 最后一场景的 closing_beat 必须**落到本章 hook**（L2 已给）。
+- 场景之间的过渡用**物件 / 时间 / 动作**（而不是抽象情绪 / 意识流）承接。
+- 目标总字数 ≈ target_words_per_chapter；均分给场景但允许 ±20%。
+
+**不要把场景写成正文**。你只产出设计（outline），L3 会按你的设计逐场景去写。"""
+
+
+L25_TASK = """## 任务
+为第 {chapter_idx} / {total_chapters} 章设计 {scenes_hint} 个场景（可在 3-5 范围浮动）。
+
+## 本章 L2 梗概
+```json
+{l2_json}
+```
+
+## 上一章收束画面（L3 实际写的）
+{prev_chapter_closing}
+
+## 参考：前面章节的场景摘要（保证节奏不重复）
+{prior_scene_summaries}
+
+## 要求
+- `chapter_index` = {chapter_idx}
+- `scenes`：列表长度 3-5；每个 SceneOutline 含 index（1-based）/ purpose / opening_beat / closing_beat / dominant_motifs / pov / approximate_words
+- `transition_notes`：列出 N-1 条跨场景转场逻辑（每条 ≤30 字，如"场景 2→3 用三枚铜钱的触感过渡"）
+- 字数分配：所有场景 approximate_words 之和 ≈ {target_words}，最后一场景略长可放结尾
+
+## 输出
+严格 JSON：
+
+```json
+{schema}
+```
+
+**只输出 JSON**，不要 markdown 包裹，不要解释。
+"""
+
+
+L3_SCENE_ANTI_COLD_OPEN = """
+## ❄️ 禁止冷开场（硬约束）
+
+**严禁**以下作为场景第一句：
+1. 重新定位主角动作：如「X 指节攥得发白」「X 喉结滚动」「X 深吸一口气」
+2. 天气/时间重述：如「天光微亮」「又是一个雨天」（除非上一场景没有这个信息）
+3. 心理综述：如「他想了很多」「种种思绪涌上来」
+4. 模板化景物：如「月光如水」「远处传来钟声」
+
+**正确做法**：
+- 从上一场景的最后一个**具体动作/物件/对白**直接往下演
+- 第一句就要产生**新信息**（新场景 / 新人物 / 新对话 / 新发现）
+- 如果场景切换需要转场，用**物件或动作**承接（如"他把三枚铜钱揣进衣襟时，庙门被推开了"）
+"""
+
+
+L3_SCENE_TASK = """## 任务
+写第 {chapter_idx} 章 · 场景 {scene_idx}/{total_scenes} 的正文。
+
+## L1 骨架（精简）
+- 标题：{l1_title}
+- 主角：{protagonist_name}（{protagonist_trait}）— 想要 {want}；需要 {need}
+- 世界规则：{world_rules}
+
+{multi_scale}
+
+{scene_card}
+
+## 要求
+1. 严格按场景设计的 opening_beat / closing_beat / purpose 写
+2. 目标字数 {target_words} ± 20%
+3. 场景 + 动作 + 对话 + 内心独白四要素齐全，但不平均分配
+4. **不要写章节标题 / 场景标号**，只写正文
+5. **不要解决本场景之外的问题**（下个场景有下个场景的事）
+6. 保持和上一场景的物件 / 时间 / 情绪**自然承接**（细节看上面"多尺度历史窗口"）
+
+{anti_cold_open}
+
+{retry_hint}
+
+## 输出
+严格 JSON：
+
+```json
+{schema}
+```
+
+字段填：
+- `chapter_index` = {chapter_idx}；`scene_index` = {scene_idx}；`revision` = {revision}
+- `content`：纯正文文本
+- `word_count`：中文字符数（不含标点和空白）
+
+## 🔴 JSON 格式铁律（违反会导致本场景作废）
+- **第一个字符必须是 `{{`**；不要 markdown 包裹
+- **`content` 里的换行用 `\\n`**（literal 两字符：反斜杠+n），不要真实换行
+- **`content` 里的引号用中文 `「」`**，不要英文 `"` 或 `'`
+- **不要出现孤立反斜杠 `\\ `**（反斜杠+空格）——会炸 JSON 解析器
+"""
+
+
+CONTINUITY_AUDIT_SYSTEM = """你是连续性审稿员。你只管一件事：**承接**。
+
+你不评审单场景写得好不好（那是 logic / pace 的活），你只看：
+1. 本章开场是否**承接上一章末段**的动作/意象（不是重述，不是重启，是延续）
+2. 场景之间转场是否有**明确物理/时间连接**（不是硬切换话题）
+3. 同一**物件**（如三枚铜钱、斗笠、泥胎）在场景之间的描述是否一致
+4. **角色情绪**推进是否连续（不能场景切换时情绪重置）
+5. 是否有**过度重复**的套路（如「指节攥得发白」在同一章出现 ≥ 3 次 → 扣分）
+
+Score ≥ 0.7 视为通过。指出的 issues 要**具体到场景编号和引文**，否则没用。"""
+
+
+CONTINUITY_AUDIT_TASK = """## 任务
+审第 {chapter_idx} 章的跨场景/跨章节连续性。
+
+## 上一章收束（对照承接）
+{prev_chapter_closing}
+
+## 本章完整正文（按场景顺序拼接）
+```
+{chapter_content}
+```
+
+## 本章场景设计（L2.5 规划的 opening_beat / closing_beat）
+{scene_outlines_text}
+
+## 检查清单（每条都给判断）
+1. 本章第一句是否承接上一章最后动作/意象（而不是重启人物）？
+2. 各场景之间转场是否自然（物件 / 时间 / 动作过渡）？有无"硬切"？
+3. 共同物件（开元通宝 / 斗笠 / 陶碗 等）在场景间描述是否一致？有无矛盾？
+4. 主角情绪是否连续推进？有无"场景切换后情绪归零"的情况？
+5. 有无过度重复套路（如"指节攥得发白"出现 > 2 次）？
+
+## 输出
+严格 JSON：
+
+```json
+{schema}
+```
+
+`head` 固定 "continuity"；`passed` = (score >= 0.7)；
+`issues` 每条 ≤40 字，**必须指明场景编号 + 引原文短片段**（如"场景 2 开头『沈砚指节攥得发白』与场景 1 末的『雨丝飘落』无物理承接"）；
+`suggestions` 每条 ≤30 字，告诉下次重写该怎么承接。
+"""
+
 
 def l25_prompt(state: NovelState, chapter_idx: int) -> str:
-    """V4 L2.5：把 L2 梗概拆成 3-5 个场景。占位版。"""
+    """V4 L2.5：把 L2 梗概拆成 3-5 个场景。"""
+    ui = state.user_input
     l2 = next(c for c in state.l2 if c.index == chapter_idx)
+
+    # 上一章的最后场景 closing（如果有）
+    prev_closing = "（本章是第 1 章，无上一章收束）"
+    prior = _prior_chapter_last_scenes(state, chapter_idx, n=1)
+    if prior and prior[-1].actual_closing:
+        pc = prior[-1]
+        prev_closing = f"第 {pc.chapter_index} 章末场景收束：「{pc.actual_closing}」"
+
+    # 前面 2 章的场景摘要（让 L2.5 避免重复节奏套路）
+    prior_all = _prior_chapter_last_scenes(state, chapter_idx, n=2)
+    if prior_all:
+        scene_lines = []
+        for sc in prior_all:
+            o = sc.outline
+            scene_lines.append(f"- 第 {sc.chapter_index} 章最后场景：目的={o.purpose}；开场={o.opening_beat}；结尾={o.closing_beat}")
+        prior_summaries = "\n".join(scene_lines)
+    else:
+        prior_summaries = "（无）"
+
+    retry = _retry_hint(state, f"L25_{chapter_idx}")
+
     return (
-        f"将第 {chapter_idx} 章的 L2 梗概拆解为 3-5 个场景。\n"
-        f"L2 梗概：{l2.summary}\nhook：{l2.hook}\n\n"
-        "输出 JSON 符合 ChapterSceneList schema：\n"
-        f"{schema_of(ChapterSceneList)}"
+        _CREATIVITY_HEADER.get(ui.creativity, "")
+        + _lang_meta_header(ui.language)
+        + L25_SYSTEM
+        + _bible_context_block(state.world_bible, "L2")
+        + "\n\n"
+        + L25_TASK.format(
+            chapter_idx=chapter_idx,
+            total_chapters=ui.chapter_count,
+            scenes_hint=ui.scenes_per_chapter_hint,
+            l2_json=l2.model_dump_json(indent=2),
+            prev_chapter_closing=prev_closing,
+            prior_scene_summaries=prior_summaries,
+            target_words=ui.target_words_per_chapter,
+            schema=schema_of(ChapterSceneList),
+        )
+        + (f"\n\n## 上轮审稿反馈（请针对性修正）\n{retry}" if retry else "")
+        + _final_audit_retry_block(state)
     )
 
 
 def l3_scene_prompt(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
-    """V4 L3 单场景写作。占位版。"""
+    """V4 L3 单场景写作 · 多尺度上下文注入。"""
     sl = next(x for x in state.scene_lists if x.chapter_index == chapter_idx)
     outline = next(s for s in sl.scenes if s.index == scene_idx)
+    total_scenes = len(sl.scenes)
+    l1 = state.l1
+    cur_scene_draft = next((d for d in state.l3_scenes
+                             if d.chapter_index == chapter_idx and d.scene_index == scene_idx), None)
+    revision = cur_scene_draft.revision if cur_scene_draft else 0
+
+    # 灵感库 RAG：用场景 purpose + opening_beat 做 query
+    mini_l2 = type("MiniL2", (), {"summary": outline.purpose, "hook": outline.closing_beat})()
+    inspiration_block = _inspiration_few_shot(state, mini_l2)
+
+    multi_scale = _scene_multi_scale_context(state, chapter_idx, scene_idx)
+    scene_card = _scene_card_block(state, chapter_idx, scene_idx)
+    bible_block = _bible_context_block(state.world_bible, "L3") if _v3_active(state) or state.user_input.pipeline_version == "v4" else ""
+    retry = _retry_hint(state, f"L3_{chapter_idx}_{scene_idx}")
+    final_audit_block = _final_audit_retry_block(state)
+
     return (
-        f"写第 {chapter_idx} 章第 {scene_idx} 场景正文。\n"
-        f"场景设计：目的={outline.purpose}；开场={outline.opening_beat}；"
-        f"结尾={outline.closing_beat}；目标字数={outline.approximate_words}\n\n"
-        "输出 JSON 符合 L3SceneDraft schema：\n"
-        f"{schema_of(L3SceneDraft)}"
+        l3_system_for(state.user_input.genre, state.user_input.language, state.user_input.creativity)
+        + inspiration_block
+        + bible_block
+        + final_audit_block
+        + "\n\n"
+        + L3_SCENE_TASK.format(
+            chapter_idx=chapter_idx,
+            scene_idx=scene_idx,
+            total_scenes=total_scenes,
+            l1_title=l1.title,
+            protagonist_name=l1.protagonist.name,
+            protagonist_trait="、".join(l1.protagonist.traits),
+            want=l1.protagonist.want,
+            need=l1.protagonist.need,
+            world_rules="；".join(l1.world_rules),
+            multi_scale=multi_scale,
+            scene_card=scene_card,
+            target_words=outline.approximate_words,
+            anti_cold_open=L3_SCENE_ANTI_COLD_OPEN,
+            retry_hint=(f"## 上轮审稿反馈\n{retry}" if retry else ""),
+            schema=schema_of(L3SceneDraft),
+            revision=revision,
+        )
     )
 
 
 def continuity_audit_prompt(state: NovelState, target_idx: int) -> str:
-    """V4 continuity 审头。占位版。"""
+    """V4 continuity 审头：跨场景/跨章节承接质量。"""
     from .state import AuditReport
-    return (
-        f"检查第 {target_idx} 章的跨场景/跨章节连续性。"
-        "输出 AuditReport，head='continuity'。\n"
-        f"{schema_of(AuditReport)}"
+    # 拼接本章全部场景
+    chapter_scenes = sorted(
+        [s for s in state.l3_scenes if s.chapter_index == target_idx],
+        key=lambda s: s.scene_index,
+    )
+    chapter_content = "\n\n--- 场景分隔 ---\n\n".join(
+        f"【场景 {s.scene_index}】\n{s.content}" for s in chapter_scenes
+    )
+
+    # 上一章收束
+    prior = _prior_chapter_last_scenes(state, target_idx, n=1)
+    if prior and prior[-1].actual_closing:
+        prev_closing = f"第 {prior[-1].chapter_index} 章收束：「{prior[-1].actual_closing}」"
+    else:
+        prev_closing = "（本章是第 1 章，无上一章可对照）"
+
+    # 本章 L2.5 场景设计
+    sl = next((x for x in state.scene_lists if x.chapter_index == target_idx), None)
+    if sl:
+        outlines_text = "\n".join(
+            f"- 场景 {o.index}：开场「{o.opening_beat}」→ 结尾「{o.closing_beat}」（{o.purpose}）"
+            for o in sl.scenes
+        )
+    else:
+        outlines_text = "（无场景设计）"
+
+    return CONTINUITY_AUDIT_SYSTEM + "\n\n" + CONTINUITY_AUDIT_TASK.format(
+        chapter_idx=target_idx,
+        prev_chapter_closing=prev_closing,
+        chapter_content=chapter_content,
+        scene_outlines_text=outlines_text,
+        schema=schema_of(AuditReport),
     )

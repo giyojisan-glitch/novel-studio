@@ -544,6 +544,66 @@ class TestDecideNextV4:
         assert decide_next(s) == "final_audit"
 
 
+class TestSceneMultiScaleContext:
+    """V4: _scene_multi_scale_context 在不同场景位置上产出正确的多尺度 context。"""
+
+    def _v4_with_scenes(self, tmp_path_like=None):
+        s = _make_state("v4", chapters=3)
+        # 加第 1 章完整设计 + 正文
+        so_a = SceneOutline(index=1, purpose="a", opening_beat="ao", closing_beat="ac")
+        so_b = SceneOutline(index=2, purpose="b", opening_beat="bo", closing_beat="bc")
+        s.scene_lists.append(ChapterSceneList(chapter_index=1, scenes=[so_a, so_b]))
+        s.l3_scenes.append(L3SceneDraft(chapter_index=1, scene_index=1,
+                                         content="A" * 100 + "第一场景结尾",
+                                         word_count=110))
+        s.l3_scenes.append(L3SceneDraft(chapter_index=1, scene_index=2,
+                                         content="B" * 100 + "第二场景结尾",
+                                         word_count=110))
+        s.scene_cards.append(SceneCard(chapter_index=1, scene_index=1, outline=so_a,
+                                        actual_opening="A" * 50,
+                                        actual_closing="第一场景结尾"))
+        s.scene_cards.append(SceneCard(chapter_index=1, scene_index=2, outline=so_b,
+                                        actual_opening="B" * 50,
+                                        actual_closing="第二场景结尾"))
+        return s
+
+    def test_first_scene_first_chapter_has_no_context(self):
+        s = _make_state("v4", chapters=3)
+        ctx = P._scene_multi_scale_context(s, chapter_idx=1, scene_idx=1)
+        assert ctx == ""   # 第一章第一场景，无任何历史
+
+    def test_mid_chapter_scene_uses_same_chapter_prev(self):
+        s = self._v4_with_scenes()
+        ctx = P._scene_multi_scale_context(s, chapter_idx=1, scene_idx=2)
+        # 应引用场景 1 的尾段
+        assert "同章上一场景" in ctx
+        assert "第一场景结尾" in ctx
+
+    def test_new_chapter_first_scene_uses_prev_chapter_last_scene(self):
+        s = self._v4_with_scenes()
+        # 加第 2 章设计
+        so_c = SceneOutline(index=1, purpose="c", opening_beat="co", closing_beat="cc")
+        s.scene_lists.append(ChapterSceneList(chapter_index=2, scenes=[so_c]))
+        ctx = P._scene_multi_scale_context(s, chapter_idx=2, scene_idx=1)
+        # 应引用第 1 章最后场景（场景 2）的尾段
+        assert "上一章最后一场景" in ctx
+        assert "第二场景结尾" in ctx
+
+    def test_l3_scene_prompt_includes_anti_cold_open(self):
+        s = self._v4_with_scenes()
+        so_c = SceneOutline(index=1, purpose="c", opening_beat="co", closing_beat="cc",
+                            approximate_words=400)
+        s.scene_lists.append(ChapterSceneList(chapter_index=2, scenes=[so_c]))
+        import os
+        os.environ["NOVEL_STUDIO_NO_RAG"] = "1"
+        try:
+            prompt = P.l3_scene_prompt(s, chapter_idx=2, scene_idx=1)
+        finally:
+            os.environ.pop("NOVEL_STUDIO_NO_RAG", None)
+        assert "禁止冷开场" in prompt
+        assert "指节攥得发白" in prompt  # 明确禁止的模板
+
+
 class TestV4PipelineSmoke:
     """StubProvider 跑完整 V4 pipeline：3 章 × 3 场景 = 9 个 L3_scene + 章节级 audit + bible_update + final_audit + L4。"""
 
