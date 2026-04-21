@@ -50,6 +50,41 @@ class TestAggregate:
         with pytest.raises(ValueError):
             aggregate("L1", None, [])
 
+    # ---------- V4: 3-head chapter audit (logic + pace + continuity) ----------
+
+    def test_three_heads_all_pass(self):
+        reports = [
+            _report("logic", True, 0.85),
+            _report("pace", True, 0.80),
+            _report("continuity", True, 0.75),
+        ]
+        v = aggregate("L3", 1, reports)
+        assert v.passed is True
+        assert len(v.reports) == 3
+
+    def test_three_heads_continuity_fails_below_avg_threshold(self):
+        """继续性头大挂，即使 logic/pace 过也应打回（avg 拉不起来）。"""
+        reports = [
+            _report("logic", True, 0.75),
+            _report("pace", True, 0.75),
+            _report("continuity", False, 0.3, ["场景 2 开头重启人物"]),
+        ]
+        v = aggregate("L3", 1, reports)
+        # avg = 0.6 < 0.7 → 失败
+        assert v.passed is False
+        assert "场景 2 开头重启人物" in v.retry_hint
+
+    def test_three_heads_continuity_only_pass_still_passes_if_avg_high(self):
+        """极端情况：只有 continuity 通过，但平均高 → 仍过（MVP 宽松）。"""
+        reports = [
+            _report("logic", False, 0.69),   # 边缘失败
+            _report("pace", False, 0.68),
+            _report("continuity", True, 0.90),
+        ]
+        v = aggregate("L3", 1, reports)
+        # avg = (0.69+0.68+0.9)/3 = 0.756 >= 0.7 且至少 1 头过 → 过
+        assert v.passed is True
+
 
 class TestForcePass:
     def test_under_max_doesnt_force(self):

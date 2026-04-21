@@ -46,7 +46,63 @@ def export_artifacts(state: NovelState, pdir: Path) -> Path:
         (adir / "05_slop_report.md").write_text(_render_slop(state), encoding="utf-8")
     if state.world_bible:
         (adir / "06_world_bible.md").write_text(_render_world_bible(state), encoding="utf-8")
+    if state.scene_lists:
+        (adir / "07_scene_lists.md").write_text(_render_scene_lists(state), encoding="utf-8")
+    if state.scene_cards:
+        (adir / "08_scene_cards.md").write_text(_render_scene_cards(state), encoding="utf-8")
     return adir
+
+
+def _render_scene_lists(state: NovelState) -> str:
+    """V4 L2.5 产出：每章的场景设计列表（不含 L3 实际 prose）。"""
+    L = ["# Scene Lists（V4 L2.5 章节场景分解）\n"]
+    for csl in sorted(state.scene_lists, key=lambda x: x.chapter_index):
+        l2 = next((c for c in state.l2 if c.index == csl.chapter_index), None)
+        title = l2.title if l2 else f"第 {csl.chapter_index} 章"
+        L.append(f"## 第 {csl.chapter_index} 章 · {title}  （revision={csl.revision}）\n")
+        for i, sc in enumerate(csl.scenes, 1):
+            L.append(f"### 场景 {sc.index}（目标 {sc.approximate_words} 字）")
+            L.append(f"- **目的**：{sc.purpose}")
+            L.append(f"- **开场落点**：{sc.opening_beat}")
+            L.append(f"- **结尾落点**：{sc.closing_beat}")
+            if sc.dominant_motifs:
+                L.append(f"- **核心意象**：{'、'.join(sc.dominant_motifs)}")
+            if sc.pov:
+                L.append(f"- **视角**：{sc.pov}")
+            L.append("")
+        if csl.transition_notes:
+            L.append("### 转场注记")
+            for note in csl.transition_notes:
+                L.append(f"- {note}")
+            L.append("")
+        L.append("---\n")
+    return "\n".join(L)
+
+
+def _render_scene_cards(state: NovelState) -> str:
+    """V4 SceneCard：设计 + L3 实际 prose 首尾 200 字，供对照验证。"""
+    L = ["# Scene Cards（V4 设计 vs 实际对照）\n"]
+    L.append("> 每张卡片左侧是 L2.5 设计的 opening/closing beat，右侧是 L3 实际写出来的首/尾 200 字。")
+    L.append("> 用于人眼检查：LLM 有没有按设计走？有没有跨场景承接？\n")
+    L.append("---\n")
+
+    by_ch: dict[int, list] = {}
+    for card in state.scene_cards:
+        by_ch.setdefault(card.chapter_index, []).append(card)
+
+    for ch in sorted(by_ch.keys()):
+        cards = sorted(by_ch[ch], key=lambda c: c.scene_index)
+        L.append(f"## 第 {ch} 章 · {len(cards)} 个场景\n")
+        for card in cards:
+            o = card.outline
+            L.append(f"### 场景 {card.scene_index}")
+            L.append(f"**设计目的**：{o.purpose}")
+            L.append(f"**设计开场**：{o.opening_beat}  →  **实际开场**：「{card.actual_opening}」")
+            L.append(f"**设计结尾**：{o.closing_beat}  →  **实际结尾**：「{card.actual_closing}」")
+            L.append(f"**字数**：目标 {o.approximate_words} / 实际 {card.actual_word_count}")
+            L.append("")
+        L.append("---\n")
+    return "\n".join(L)
 
 
 def _render_world_bible(state: NovelState) -> str:
