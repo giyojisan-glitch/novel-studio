@@ -102,6 +102,35 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         "paid_foreshadow": [],
         "consistency_issues": [],
     },
+    "_L25_TEMPLATE": {
+        # chapter_index 由 _template_for 注入
+        "scenes": [
+            {"index": 1, "purpose": "建立场景", "opening_beat": "开场动作 1",
+             "closing_beat": "落点 1", "dominant_motifs": ["物件A"],
+             "pov": "第三人称限知", "approximate_words": 300},
+            {"index": 2, "purpose": "冲突推进", "opening_beat": "开场动作 2",
+             "closing_beat": "落点 2", "dominant_motifs": ["物件B"],
+             "pov": "第三人称限知", "approximate_words": 300},
+            {"index": 3, "purpose": "章末钩子", "opening_beat": "开场动作 3",
+             "closing_beat": "悬念落点", "dominant_motifs": ["物件C"],
+             "pov": "第三人称限知", "approximate_words": 300},
+        ],
+        "transition_notes": ["场景 1→2 用物件过渡", "场景 2→3 用时间过渡"],
+        "revision": 0,
+    },
+    "_L3_SCENE_TEMPLATE": {
+        # chapter_index / scene_index 由 _template_for 注入
+        "content": "场景正文。" * 40,
+        "word_count": 200,
+        "revision": 0,
+    },
+    "_AUDIT_CONTINUITY": {
+        "head": "continuity",
+        "passed": True,
+        "score": 0.8,
+        "issues": [],
+        "suggestions": [],
+    },
 }
 
 
@@ -140,27 +169,59 @@ class StubProvider(BaseProvider):
         if step_id == "final_audit":
             return dict(t["final_audit"])
 
-        # 带索引的模式：L2_N / L3_N / L4_adversarial_N / L4_scrubber_N
+        # 带索引的模式：L2_N / L3_N (严格：恰好 2 部分) / L4_adversarial_N / L4_scrubber_N
+        parts = step_id.split("_")
+
         if step_id.startswith("L2_") and not step_id.endswith(("_logic", "_pace")):
-            idx = int(step_id.split("_")[1])
-            return {**dict(t["_L2_TEMPLATE"]), "index": idx}
-        if step_id.startswith("L3_") and not step_id.endswith(("_logic", "_pace")):
-            idx = int(step_id.split("_")[1])
+            # V2 L2_{N}：恰好 L2_{数字}
+            if len(parts) == 2 and parts[1].isdigit():
+                idx = int(parts[1])
+                return {**dict(t["_L2_TEMPLATE"]), "index": idx}
+
+        # V4: L25_{i} = 章节场景列表（要在 L2_ 之后、L3_ 之前检查，因为 L25 也以 "L2" 开头是误导）
+        if step_id.startswith("L25_") and not step_id.endswith(("_logic", "_pace", "_continuity")):
+            if len(parts) == 2 and parts[1].isdigit():
+                idx = int(parts[1])
+                base = dict(t["_L25_TEMPLATE"])
+                base["scenes"] = [dict(s) for s in base["scenes"]]
+                return {**base, "chapter_index": idx}
+
+        # V4: L3_{i}_{s} = 单场景正文（优先，因为它比 V3 L3_N 更具体）
+        if (step_id.startswith("L3_")
+            and not step_id.endswith(("_logic", "_pace", "_continuity"))
+            and len(parts) == 3
+            and parts[1].isdigit()
+            and parts[2].isdigit()
+        ):
+            i, s = int(parts[1]), int(parts[2])
+            base = dict(t["_L3_SCENE_TEMPLATE"])
+            return {**base, "chapter_index": i, "scene_index": s}
+
+        # V3/V1/V2: L3_{N}（严格恰好 2 部分）
+        if (step_id.startswith("L3_")
+            and not step_id.endswith(("_logic", "_pace", "_continuity"))
+            and len(parts) == 2
+            and parts[1].isdigit()
+        ):
+            idx = int(parts[1])
             return {**dict(t["_L3_TEMPLATE"]), "index": idx}
+
         if step_id.startswith("L4_adversarial_"):
-            # 返回一个 AdversarialCut 列表（而不是单个 object）
             return list(t["_L4_ADVERSARIAL_TEMPLATE"])
         if step_id.startswith("L4_scrubber_"):
-            idx = int(step_id.split("_")[2])
+            idx = int(parts[2])
             return {**dict(t["_L4_SCRUBBER_TEMPLATE"]), "index": idx}
         if step_id.startswith("bible_update_"):
-            idx = int(step_id.split("_")[2])
+            idx = int(parts[2])
             base = dict(t["_BIBLE_UPDATE_TEMPLATE"])
-            # 深拷贝 character_updates 避免 stub 间共享
             base["character_updates"] = [
                 {**c, "last_appeared_in": idx} for c in base["character_updates"]
             ]
             return {**base, "chapter_index": idx}
+
+        # V4: continuity audit head
+        if step_id.endswith("_audit_continuity"):
+            return dict(t["_AUDIT_CONTINUITY"])
 
         # Audit：默认通过
         if step_id.endswith("_audit_logic"):

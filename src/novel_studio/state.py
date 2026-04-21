@@ -8,7 +8,7 @@ Genre = Literal["科幻", "悬疑", "武侠", "都市", "奇幻", "仙侠", "历
 Language = Literal["zh", "ja"]
 Creativity = Literal["strict", "balanced", "creative"]
 Layer = Literal["L1", "L2", "L3", "L4"]
-AuditHead = Literal["logic", "pace", "style", "character"]
+AuditHead = Literal["logic", "pace", "style", "character", "continuity"]
 
 
 class UserInput(BaseModel):
@@ -24,7 +24,10 @@ class UserInput(BaseModel):
     #   v1 = 原始（L3 全部写完 → finalize，L4 透传）
     #   v2 = V2 增强（L3 → final_audit → L4_adversarial → L4_scrubber → finalize）
     #   v3 = V3 长篇（interleaved L2_i → L3_i → bible_update_i，世界观知识库维护跨章一致性）
-    pipeline_version: Literal["v1", "v2", "v3"] = "v1"
+    #   v4 = V4 场景分解（L2_i → L2.5_i 场景列表 → L3_{i,s} 逐场景写作 + continuity 审头）
+    pipeline_version: Literal["v1", "v2", "v3", "v4"] = "v1"
+    # V4: L2.5 场景分解层的软目标——每章 3-5 场景，LLM 在此范围内自由决定
+    scenes_per_chapter_hint: int = Field(4, ge=2, le=8)
 
 
 class CharacterCard(BaseModel):
@@ -152,6 +155,48 @@ class BibleUpdate(BaseModel):
     consistency_issues: list[str] = Field(default_factory=list)  # 与 bible 矛盾的地方（写给下次 L3 retry 的）
 
 
+# ============ V4: 场景分解层（L2.5） ============
+class SceneOutline(BaseModel):
+    """L2.5 产出的一个场景的设计。章内顺序 1..M。"""
+    index: int                                                  # 场景在章节内的顺序
+    purpose: str                                                # 本场景推进什么（≤40 字）
+    opening_beat: str                                           # 开场第一个动作/画面（≤30 字）
+    closing_beat: str                                           # 落点动作/画面（≤30 字）
+    dominant_motifs: list[str] = Field(default_factory=list)    # 核心意象/物件
+    pov: str = ""                                               # 视角
+    approximate_words: int = Field(300, ge=100, le=1500)        # 目标字数
+
+
+class ChapterSceneList(BaseModel):
+    """一个章节的场景列表（L2.5 主输出）。"""
+    chapter_index: int
+    scenes: list[SceneOutline] = Field(default_factory=list)    # 通常 3-5 个
+    transition_notes: list[str] = Field(default_factory=list)   # 场景之间要注意的转场（≤30 字/条）
+    revision: int = 0
+
+
+class L3SceneDraft(BaseModel):
+    """单个场景的 L3 产出（V4）。"""
+    chapter_index: int
+    scene_index: int
+    content: str
+    word_count: int
+    revision: int = 0
+
+
+class SceneCard(BaseModel):
+    """某场景的完整档案：L2.5 设计 + L3 实际 prose 摘录。
+
+    跨章节查询用：新章节 L2/L3 prompt 可以注入 prior chapters 的 last SceneCard。
+    """
+    chapter_index: int
+    scene_index: int
+    outline: SceneOutline                                       # 设计部分
+    actual_opening: str = ""                                    # L3 写完后填：实际首 200 字
+    actual_closing: str = ""                                    # L3 写完后填：实际末 200 字
+    actual_word_count: int = 0
+
+
 class FinalVerdict(BaseModel):
     """V2: 成品审——对照 premise 原文审整本书，能抓跨层 bug（时间线/伏笔/角色坍塌）。"""
     usable: bool
@@ -183,6 +228,13 @@ class NovelState(BaseModel):
     # V3: 长篇专用——世界观知识库 + bible_update 指针
     world_bible: Optional[WorldBible] = None
     current_bible_update_idx: int = 0                        # 下一个要跑 bible_update 的章节（v3）
+
+    # V4: 场景分解层 + 多尺度连续性
+    scene_lists: list[ChapterSceneList] = Field(default_factory=list)   # L2.5 产出，每章一条
+    l3_scenes: list[L3SceneDraft] = Field(default_factory=list)         # 逐场景 L3 草稿
+    scene_cards: list[SceneCard] = Field(default_factory=list)          # 完整档案（设计+实际摘录）
+    current_l25_idx: int = 0                                            # 当前进到哪一章的 L2.5
+    current_scene_idx: int = 0                                          # 当前章内推进到第几场景（1 基）
 
     next_step: str = "L1"
     completed: bool = False

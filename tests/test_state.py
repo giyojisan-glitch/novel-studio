@@ -16,6 +16,10 @@ from novel_studio.state import (
     AuditReport,
     AuditVerdict,
     FinalVerdict,
+    SceneOutline,
+    ChapterSceneList,
+    L3SceneDraft,
+    SceneCard,
 )
 
 
@@ -52,6 +56,96 @@ class TestUserInput:
     def test_words_per_chapter_bounds(self):
         with pytest.raises(ValueError):
             UserInput(premise="t", target_words_per_chapter=100)
+
+    def test_v4_pipeline_opt_in(self):
+        ui = UserInput(premise="test", pipeline_version="v4")
+        assert ui.pipeline_version == "v4"
+        assert ui.scenes_per_chapter_hint == 4  # 默认
+
+    def test_v4_scenes_hint_bounds(self):
+        ui = UserInput(premise="t", pipeline_version="v4", scenes_per_chapter_hint=3)
+        assert ui.scenes_per_chapter_hint == 3
+        with pytest.raises(ValueError):
+            UserInput(premise="t", pipeline_version="v4", scenes_per_chapter_hint=1)
+        with pytest.raises(ValueError):
+            UserInput(premise="t", pipeline_version="v4", scenes_per_chapter_hint=9)
+
+
+# ---------- V4: SceneOutline / ChapterSceneList / L3SceneDraft / SceneCard ----------
+
+
+class TestV4Schema:
+    def test_scene_outline_basic(self):
+        so = SceneOutline(
+            index=1, purpose="主角进庙避雨",
+            opening_beat="雨打瓦", closing_beat="看见斗笠客",
+            dominant_motifs=["雨", "土地庙"],
+            pov="第三人称限知", approximate_words=300,
+        )
+        assert so.index == 1
+        assert "雨" in so.dominant_motifs
+
+    def test_scene_outline_approximate_words_bounds(self):
+        with pytest.raises(ValueError):
+            SceneOutline(index=1, purpose="p", opening_beat="o",
+                         closing_beat="c", approximate_words=50)
+        with pytest.raises(ValueError):
+            SceneOutline(index=1, purpose="p", opening_beat="o",
+                         closing_beat="c", approximate_words=2000)
+
+    def test_chapter_scene_list_defaults_empty(self):
+        csl = ChapterSceneList(chapter_index=1)
+        assert csl.scenes == []
+        assert csl.transition_notes == []
+        assert csl.revision == 0
+
+    def test_chapter_scene_list_with_scenes(self):
+        so1 = SceneOutline(index=1, purpose="p1", opening_beat="o1", closing_beat="c1")
+        so2 = SceneOutline(index=2, purpose="p2", opening_beat="o2", closing_beat="c2")
+        csl = ChapterSceneList(chapter_index=1, scenes=[so1, so2],
+                               transition_notes=["场景 1→2 用物件过渡"])
+        assert len(csl.scenes) == 2
+        assert csl.scenes[0].index == 1
+
+    def test_l3_scene_draft(self):
+        d = L3SceneDraft(chapter_index=2, scene_index=3,
+                         content="场景正文", word_count=200)
+        assert d.chapter_index == 2 and d.scene_index == 3
+        assert d.revision == 0
+
+    def test_scene_card_with_actual_excerpts(self):
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c")
+        sc = SceneCard(chapter_index=1, scene_index=1, outline=so,
+                       actual_opening="实际开场", actual_closing="实际结尾",
+                       actual_word_count=300)
+        assert sc.outline.index == 1
+        assert sc.actual_opening == "实际开场"
+
+    def test_novel_state_v4_fields_default_empty(self):
+        ui = UserInput(premise="test premise long enough", pipeline_version="v4")
+        ns = NovelState(user_input=ui)
+        assert ns.scene_lists == []
+        assert ns.l3_scenes == []
+        assert ns.scene_cards == []
+        assert ns.current_l25_idx == 0
+        assert ns.current_scene_idx == 0
+
+    def test_novel_state_v4_roundtrip(self):
+        ui = UserInput(premise="test premise long enough", pipeline_version="v4")
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c")
+        csl = ChapterSceneList(chapter_index=1, scenes=[so])
+        sd = L3SceneDraft(chapter_index=1, scene_index=1, content="x", word_count=1)
+        card = SceneCard(chapter_index=1, scene_index=1, outline=so,
+                         actual_opening="o", actual_closing="c")
+        ns = NovelState(user_input=ui, scene_lists=[csl], l3_scenes=[sd],
+                        scene_cards=[card], current_l25_idx=1, current_scene_idx=2)
+        import json
+        round_tripped = NovelState(**json.loads(ns.model_dump_json()))
+        assert round_tripped.scene_lists == ns.scene_lists
+        assert round_tripped.l3_scenes == ns.l3_scenes
+        assert round_tripped.scene_cards == ns.scene_cards
+        assert round_tripped.current_l25_idx == 1
+        assert round_tripped.current_scene_idx == 2
 
 
 # ---------- CharacterCard (wound/lie V2) ----------
