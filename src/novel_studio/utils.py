@@ -44,7 +44,76 @@ def export_artifacts(state: NovelState, pdir: Path) -> Path:
         (adir / "04_audit_历程.md").write_text(_render_audits(state), encoding="utf-8")
     if state.l3:
         (adir / "05_slop_report.md").write_text(_render_slop(state), encoding="utf-8")
+    if state.world_bible:
+        (adir / "06_world_bible.md").write_text(_render_world_bible(state), encoding="utf-8")
     return adir
+
+
+def _render_world_bible(state: NovelState) -> str:
+    """V3 WorldBible 导出为人类可读 markdown。"""
+    b = state.world_bible
+    if b is None:
+        return "（WorldBible 未初始化）\n"
+    L = ["# World Bible（V3 跨章真相账本）\n"]
+    L.append(f"**最后更新到第 {b.last_updated_ch} 章**\n")
+    L.append("---\n")
+
+    L.append("## 角色\n")
+    if not b.characters:
+        L.append("（无）\n")
+    for c in b.characters:
+        L.append(f"### {c.name}")
+        if c.traits:
+            L.append(f"- 特质：{'、'.join(c.traits)}")
+        if c.arc_state:
+            L.append(f"- 弧光阶段：{c.arc_state}")
+        if c.last_appeared_in:
+            L.append(f"- 最后出场：第 {c.last_appeared_in} 章")
+        if c.voice_markers:
+            L.append(f"- 说话方式：{'/'.join(c.voice_markers)}")
+        if c.notable_events:
+            L.append("- 已发生事件：")
+            for e in c.notable_events:
+                L.append(f"  - {e}")
+        L.append("")
+
+    L.append("## 硬设定（WorldFact）\n")
+    if not b.facts:
+        L.append("（无）\n")
+    by_cat: dict[str, list] = {}
+    for f in b.facts:
+        by_cat.setdefault(f.category, []).append(f)
+    cat_names = {"rule": "规则", "location": "场所", "item": "物件",
+                 "relationship": "关系", "event": "事件"}
+    for cat, items in by_cat.items():
+        L.append(f"### {cat_names.get(cat, cat)}")
+        for f in items:
+            L.append(f"- {f.content}  *（第 {f.ch_introduced} 章引入）*")
+        L.append("")
+
+    L.append("## 伏笔账本\n")
+    L.append("### 未兑现（active）")
+    if b.active_foreshadow:
+        for fs in b.active_foreshadow:
+            L.append(f"- {fs}")
+    else:
+        L.append("（无）")
+    L.append("\n### 已兑现（paid）")
+    if b.paid_foreshadow:
+        for fs in b.paid_foreshadow:
+            L.append(f"- {fs}")
+    else:
+        L.append("（无）")
+    L.append("")
+
+    L.append("## 大事时间线\n")
+    if b.timeline:
+        for i, e in enumerate(b.timeline, 1):
+            L.append(f"{i}. {e}")
+    else:
+        L.append("（无）")
+    L.append("")
+    return "\n".join(L)
 
 
 def _render_slop(state: NovelState) -> str:
