@@ -14,6 +14,16 @@ V2 Pipeline (user_input.pipeline_version == "v2"):
          └─ usable=False → bounce to suspect_layer（重跑那一层）
   finalize 用 L4 内容（而不是 L3）组装 MD
 
+V3 Pipeline (pipeline_version == "v3"，长篇专用):
+  L1 → L1_audit → bible_init (synthetic)
+       → 对每章 i in 1..N 交替进行：
+           L2_i → L2_i_audit → L3_i → L3_i_audit → bible_update_i
+       → final_audit → L4_adversarial → L4_scrubber → finalize
+  特点：
+    - interleaved L2/L3（每章出梗概立即写正文，L2_{i+1} 能看到 L3_i 实际文本）
+    - bible_update_i 增量维护 WorldBible（角色状态 / 硬设定 / 伏笔流转）
+    - L2/L3 prompt 注入 bible context → 跨章一致性
+
 V1 Pipeline（默认，向后兼容）：
   L1 → L1_audit → L2_* → L3_* → finalize（L4 透传）
 """
@@ -30,6 +40,7 @@ from .state import (
     AuditReport,
     AdversarialCut,
     FinalVerdict,
+    BibleUpdate,
 )
 from . import prompts as P
 from .audit import aggregate, should_force_pass, MAX_REVISION
@@ -54,12 +65,12 @@ DEFAULT_PROVIDER: BaseProvider = HumanQueueProvider()
 
 
 def expected_prompts(next_step: str) -> list[str]:
-    """next_step → 该步需要哪些 prompt 文件。audit 步有 2 个 head 并行；final_audit / L4_* 是单个 prompt。"""
-    if next_step in ("finalize", "DONE"):
-        return []
+    """next_step → 该步需要哪些 prompt 文件。audit 步有 2 个 head 并行；final_audit / L4_* / bible_update_* 是单个 prompt。"""
+    if next_step in ("finalize", "DONE", "bible_init"):
+        return []                                    # bible_init 为纯合成（无 LLM）
     if next_step == "final_audit":
         return ["final_audit"]
-    if next_step.startswith(("L4_adversarial_", "L4_scrubber_")):
+    if next_step.startswith(("L4_adversarial_", "L4_scrubber_", "bible_update_")):
         return [next_step]
     if next_step.endswith("_audit"):
         base = next_step[:-len("_audit")]
@@ -97,6 +108,9 @@ def build_prompt(state: NovelState, step_id: str) -> str:
     if step_id.startswith("L4_scrubber_"):
         idx = int(step_id.split("_")[2])
         return P.scrubber_prompt(state, idx)
+    if step_id.startswith("bible_update_"):
+        idx = int(step_id.split("_")[2])
+        return P.bible_update_prompt(state, idx)
     raise ValueError(f"unknown step_id: {step_id}")
 
 
@@ -150,6 +164,12 @@ def apply_responses(
             polished = L4PolishedChapter(**_coerce_dict(data, expected_index=idx))
             polished.index = idx
             _upsert_l4_polished(state, polished)
+        elif sid.startswith("bible_update_"):
+            idx = int(sid.split("_")[2])
+            # BibleUpdate 字段是 chapter_index（不是 index），用 None 跳过索引校验
+            update = BibleUpdate(**_coerce_dict(data, expected_index=None))
+            update.chapter_index = idx                          # 强制对齐，防 LLM 写错
+            _apply_bible_update_to_state(state, update)
     else:
         # audit 一组：2 头 → 聚合
         reports = [AuditReport(**_fetch(sid)) for sid in step_ids]
@@ -212,6 +232,14 @@ def _upsert_l4_polished(state: NovelState, polished: L4PolishedChapter) -> None:
     state.l4.sort(key=lambda p: p.index)
 
 
+def _apply_bible_update_to_state(state: NovelState, update: BibleUpdate) -> None:
+    """合并 BibleUpdate 到 state.world_bible。v3 专用。"""
+    from .state import WorldBible
+    current = state.world_bible or WorldBible()
+    state.world_bible = P.apply_bible_update(current, update)
+    state.current_bible_update_idx = max(state.current_bible_update_idx, update.chapter_index)
+
+
 def _parse_audit_target(audit_step_id: str) -> tuple[str, int | None]:
     body = audit_step_id.rsplit("_audit_", 1)[0]
     if body == "L1":
@@ -228,8 +256,21 @@ def decide_next(state: NovelState) -> str:
     cur = state.next_step
     total = state.user_input.chapter_count
     v2 = state.user_input.pipeline_version == "v2"
+    v3 = state.user_input.pipeline_version == "v3"
+    use_final_audit = v2 or v3  # v3 沿用 v2 的成品审 + L4 润色
 
-    # V2 独有：final_audit / L4 分支优先判断（避免被下面 `_audit` 后缀误捕）
+    # bible_init 合成步完成 → 进 L2_1（不经 LLM）
+    if cur == "bible_init":
+        return "L2_1"
+
+    # bible_update_{i} 完成 → 交替：下一章 L2_{i+1}，或最后一章后的 final_audit
+    if cur.startswith("bible_update_"):
+        idx = int(cur.split("_")[2])
+        if idx < total:
+            return f"L2_{idx + 1}"
+        return "final_audit" if use_final_audit else "finalize"
+
+    # V2/V3 共用：final_audit / L4 分支优先判断（避免被下面 `_audit` 后缀误捕）
     if cur == "final_audit":
         fv = state.final_verdict
         if fv and fv.usable:
@@ -261,7 +302,8 @@ def decide_next(state: NovelState) -> str:
         if body == "L1":
             current_rev = state.l1.revision
             if verdict.passed or should_force_pass(current_rev):
-                return "L2_1"
+                # v3：先合成 bible_init，再进 L2_1
+                return "bible_init" if v3 else "L2_1"
             state.l1.revision += 1
             return "L1"
 
@@ -271,6 +313,10 @@ def decide_next(state: NovelState) -> str:
             cur_outline = next(c for c in state.l2 if c.index == idx)
             current_rev = cur_outline.revision
             if verdict.passed or should_force_pass(current_rev):
+                # v3: interleaved —— L2_i 过了立即写 L3_i
+                if v3:
+                    return f"L3_{idx}"
+                # v1/v2: 全部 L2 先出，再进 L3
                 if idx < total:
                     return f"L2_{idx + 1}"
                 return "L3_1"
@@ -280,6 +326,9 @@ def decide_next(state: NovelState) -> str:
             cur_draft = next(d for d in state.l3 if d.index == idx)
             current_rev = cur_draft.revision
             if verdict.passed or should_force_pass(current_rev):
+                # v3: 每章写完跑 bible_update 再决定下一步
+                if v3:
+                    return f"bible_update_{idx}"
                 if idx < total:
                     return f"L3_{idx + 1}"
                 # 最后一章 L3 过了：v1 直接 finalize，v2 进 final_audit
@@ -370,6 +419,9 @@ def advance(
     if state.next_step == "DONE":
         return {"status": "completed", "output": "（已完成）"}
 
+    if state.next_step == "bible_init":
+        return _do_bible_init(state, pdir, provider)
+
     expected = expected_prompts(state.next_step)
 
     # 1) 发起还没 request 过的 step（对 Anthropic 会真调 API）
@@ -438,7 +490,8 @@ def advance(
         # 同步 provider 会直接准备好 → 下次 advance 会处理；异步则返回 "advanced"
         return {"status": "advanced", "step_ids": next_expected, "next_step": new_next}
 
-    if new_next == "finalize":
+    if new_next in ("finalize", "bible_init"):
+        # 合成步无需 LLM，立即推进
         return advance(state, pdir, provider=provider)
 
     return {"status": "advanced", "step_ids": [], "next_step": new_next}
@@ -453,11 +506,23 @@ def _request_already_made(provider: BaseProvider, step_id: str, pdir: Path) -> b
     return (pdir / "queue" / f"{step_id}.prompt.md").exists()
 
 
+def _do_bible_init(state: NovelState, pdir: Path, provider: BaseProvider) -> dict:
+    """V3 合成步：从 L1 构造初始 WorldBible。无 LLM 调用，立即推进到 L2_1。"""
+    if state.l1 is None:
+        raise RuntimeError("bible_init requires L1 to exist")
+    state.world_bible = P.build_initial_bible(state.l1)
+    state.trace.append({"step": "bible_init", "applied": "synthetic"})
+    export_artifacts(state, pdir)
+    state.next_step = decide_next(state)                        # → "L2_1"
+    save_state(pdir, state)
+    return advance(state, pdir, provider=provider)              # 立即 dispatch 下一步
+
+
 def _do_finalize(state: NovelState, pdir: Path) -> dict:
-    """finalize 步：不需 LLM，直接生成 MD。v2 用 L4 内容，v1 用 L3。"""
-    v2 = state.user_input.pipeline_version == "v2"
-    # v2: L4 已经有实际 polished content；v1: 透传 L3
-    if not v2:
+    """finalize 步：不需 LLM，直接生成 MD。v2/v3 用 L4 内容，v1 用 L3。"""
+    has_l4_pipeline = state.user_input.pipeline_version in ("v2", "v3")
+    # v2/v3: L4 已经有实际 polished content；v1: 透传 L3
+    if not has_l4_pipeline:
         state.l4 = [L4PolishedChapter(index=d.index, content=d.content) for d in state.l3]
     state.final_markdown = export_markdown(state)
     local_md = pdir / "novel.md"

@@ -48,6 +48,8 @@ def cmd_init(args):
             sys.exit(1)
 
     pdir = make_project_dir(premise)
+    # --pipeline 优先；若未显式指定，fallback 到 --v2 flag
+    pipeline = args.pipeline or ("v2" if args.v2 else "v1")
     state = NovelState(
         user_input=UserInput(
             premise=premise,
@@ -56,7 +58,7 @@ def cmd_init(args):
             target_words_per_chapter=args.words,
             language=args.language,
             creativity=args.creativity,
-            pipeline_version="v2" if args.v2 else "v1",
+            pipeline_version=pipeline,
         )
     )
     save_state(pdir, state)
@@ -70,7 +72,7 @@ def cmd_init(args):
         f"📁 [yellow]{pdir}[/]\n"
         f"📖 前提：{args.premise}\n"
         f"🎭 类型：{args.genre} · 章节数：{args.chapters} · 每章 {args.words} 字\n"
-        f"🎚 创意档位：[bold]{args.creativity}[/]\n",
+        f"🎚 创意档位：[bold]{args.creativity}[/] · pipeline：[bold]{pipeline}[/]\n",
         title="✓ init"
     ))
     _print_status(state, pdir, result)
@@ -391,7 +393,10 @@ def main():
     p_init.add_argument("--words", type=int, default=1000)
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
     p_init.add_argument("--v2", action="store_true",
-                        help="启用 V2 pipeline（final_audit + L4 adversarial + L4 scrubber）")
+                        help="[legacy] 等价于 --pipeline v2")
+    p_init.add_argument("--pipeline", default=None, choices=["v1", "v2", "v3"],
+                        help="pipeline 版本：v1（默认，基础） / v2（+final_audit+L4 润色） / "
+                             "v3（+长篇 WorldBible+interleaved L2/L3，支持到 30 章）")
     p_init.add_argument("--creativity", default="balanced",
                         choices=["strict", "balanced", "creative"],
                         help="创意档位：strict(严格按 premise, temp=0.3) / balanced(默认, temp=0.7) / creative(大胆补全, temp=1.0)")

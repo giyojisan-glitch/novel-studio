@@ -13,6 +13,10 @@ from .state import (
     L4PolishedChapter,
     FinalVerdict,
     AdversarialCut,
+    WorldBible,
+    BibleUpdate,
+    CharacterState,
+    WorldFact,
 )
 
 
@@ -292,10 +296,13 @@ def l2_prompt(state: NovelState, chapter_idx: int) -> str:
         f"- 第{c.index}章《{c.title}》：{c.summary}" for c in state.l2 if c.index < chapter_idx
     ) or "（这是第一章）"
     retry = _retry_hint(state, f"L2_{chapter_idx}")
+    # V3: 如果启用了 bible（v3 pipeline），把跨章真相账本注入
+    bible_block = _bible_context_block(state.world_bible, "L2") if _v3_active(state) else ""
     return (
         _CREATIVITY_HEADER.get(state.user_input.creativity, "")
         + _lang_meta_header(state.user_input.language)
         + L2_SYSTEM
+        + bible_block
         + "\n\n"
         + L2_TASK.format(
             chapter_idx=chapter_idx,
@@ -320,10 +327,13 @@ def l3_prompt(state: NovelState, chapter_idx: int) -> str:
 
     # —— 灵感库 RAG 注入（最初 vision 的 Cross-Attention 式分层参考） ——
     inspiration_block = _inspiration_few_shot(state, l2)
+    # —— V3: 世界观 bible 注入（长篇跨章一致性） ——
+    bible_block = _bible_context_block(state.world_bible, "L3") if _v3_active(state) else ""
 
     return (
         l3_system_for(state.user_input.genre, state.user_input.language, state.user_input.creativity)
         + inspiration_block
+        + bible_block
         + "\n\n"
         + L3_TASK.format(
             chapter_idx=chapter_idx,
@@ -459,6 +469,10 @@ def _inspiration_few_shot(state: NovelState, l2) -> str:
         return ""
 
 
+def _v3_active(state: NovelState) -> bool:
+    return state.user_input.pipeline_version == "v3"
+
+
 def _retry_hint(state: NovelState, step_key: str) -> str:
     v = state.last_audit(step_key)
     if v and not v.passed:
@@ -472,6 +486,239 @@ def _current_revision(state: NovelState, step_key: str) -> int:
         draft = next((d for d in state.l3 if d.index == idx), None)
         return draft.revision if draft else 0
     return 0
+
+
+# ============ V3: 世界观知识库（WorldBible） ============
+def build_initial_bible(l1: L1Skeleton) -> WorldBible:
+    """从 L1 骨架构造初始 WorldBible。纯函数，无 LLM。
+
+    把 L1 里已有的结构化信息（主角/反派/世界规则）落到 bible：
+    - CharacterState: 主角 + 反派（如有）
+    - WorldFact: world_rules 每条转一条 rule 类 fact
+    - active_foreshadow: 从 L1.theme + protagonist.wound/lie 隐含的承诺
+    """
+    characters: list[CharacterState] = []
+    characters.append(CharacterState(
+        name=l1.protagonist.name,
+        traits=list(l1.protagonist.traits),
+        arc_state="起点：尚未觉察 need",
+        last_appeared_in=0,
+    ))
+    if l1.antagonist:
+        characters.append(CharacterState(
+            name=l1.antagonist.name,
+            traits=list(l1.antagonist.traits),
+            arc_state="起点：立场已定",
+            last_appeared_in=0,
+        ))
+    facts: list[WorldFact] = [
+        WorldFact(category="rule", content=r, ch_introduced=0)
+        for r in l1.world_rules
+    ]
+    # L1 层暗示的承诺——theme + wound/need 的张力
+    active_foreshadow: list[str] = []
+    if l1.protagonist.need:
+        active_foreshadow.append(f"主角须学会：{l1.protagonist.need}")
+    if l1.protagonist.wound:
+        active_foreshadow.append(f"主角创伤未愈：{l1.protagonist.wound}")
+    return WorldBible(
+        characters=characters,
+        facts=facts,
+        timeline=[],
+        active_foreshadow=active_foreshadow,
+        paid_foreshadow=[],
+        last_updated_ch=0,
+    )
+
+
+def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
+    """把 BibleUpdate 合并进 WorldBible。返回新的 bible（不修改原对象）。
+
+    规则：
+    - new_characters: 直接 append（去重：同名覆盖）
+    - character_updates: 按 name 匹配 → 替换已有条目的 arc_state/last_appeared_in/notable_events
+    - new_facts / timeline_additions: 直接追加
+    - new_foreshadow: 追加到 active_foreshadow
+    - paid_foreshadow: 从 active 移除 → 追加到 paid
+    """
+    chars_by_name = {c.name: c for c in bible.characters}
+    for c in update.new_characters:
+        chars_by_name[c.name] = c
+    for c in update.character_updates:
+        if c.name in chars_by_name:
+            existing = chars_by_name[c.name]
+            # 合并：traits 不动（稳定），voice_markers 合并去重，其余覆盖
+            merged_voice = list(dict.fromkeys(existing.voice_markers + c.voice_markers))
+            merged_events = list(existing.notable_events) + [
+                e for e in c.notable_events if e not in existing.notable_events
+            ]
+            chars_by_name[c.name] = CharacterState(
+                name=c.name,
+                traits=existing.traits or c.traits,
+                voice_markers=merged_voice,
+                arc_state=c.arc_state or existing.arc_state,
+                last_appeared_in=max(c.last_appeared_in, existing.last_appeared_in),
+                notable_events=merged_events,
+            )
+        else:
+            chars_by_name[c.name] = c
+
+    new_active = [f for f in bible.active_foreshadow if f not in update.paid_foreshadow]
+    new_active += [f for f in update.new_foreshadow if f not in new_active]
+    new_paid = list(bible.paid_foreshadow) + [
+        f for f in update.paid_foreshadow if f not in bible.paid_foreshadow
+    ]
+
+    return WorldBible(
+        characters=list(chars_by_name.values()),
+        facts=list(bible.facts) + list(update.new_facts),
+        timeline=list(bible.timeline) + list(update.timeline_additions),
+        active_foreshadow=new_active,
+        paid_foreshadow=new_paid,
+        last_updated_ch=max(bible.last_updated_ch, update.chapter_index),
+    )
+
+
+def _bible_context_block(bible: WorldBible | None, for_layer: str) -> str:
+    """把 bible 渲染成 L2/L3 prompt 里的一段 context 文本。
+
+    for_layer:
+    - "L2": 给章节协商用——关注弧光阶段、活跃伏笔、规则
+    - "L3": 给写作用——关注角色当前状态、不能违反的规则、需要承接的伏笔
+    """
+    if bible is None:
+        return ""
+
+    lines: list[str] = []
+    lines.append("\n\n## 📖 世界观知识库（World Bible · 跨章真相账本）")
+    lines.append("以下是前面章节已确立的事实。**本章必须与此一致，不得推翻**。\n")
+
+    if bible.characters:
+        lines.append("### 角色当前状态")
+        for c in bible.characters:
+            extra = ""
+            if c.last_appeared_in > 0:
+                extra = f"，最后出场第 {c.last_appeared_in} 章"
+            events = ""
+            if c.notable_events:
+                events = "；已发生事件：" + "、".join(c.notable_events[-3:])  # 最近 3 件
+            voice = ""
+            if c.voice_markers:
+                voice = f"；说话方式：{'/'.join(c.voice_markers[:3])}"
+            arc = f"弧光：{c.arc_state}" if c.arc_state else ""
+            lines.append(f"- **{c.name}**（{'、'.join(c.traits)}）{arc}{extra}{events}{voice}")
+        lines.append("")
+
+    if bible.facts:
+        # 只列 rule + relationship + item 类 facts（最容易被违反）
+        critical = [f for f in bible.facts if f.category in ("rule", "relationship", "item")]
+        if critical:
+            lines.append("### 已确立的硬设定（不得违反）")
+            for f in critical[:12]:  # 防爆炸，最多 12 条
+                tag = {"rule": "规则", "relationship": "关系", "item": "物件"}[f.category]
+                lines.append(f"- [{tag}] {f.content}（立于第 {f.ch_introduced} 章）")
+            lines.append("")
+
+    if bible.active_foreshadow:
+        lines.append("### 未兑现的伏笔（active）")
+        for fs in bible.active_foreshadow[:8]:
+            lines.append(f"- {fs}")
+        if for_layer == "L2":
+            lines.append("> 本章可以考虑兑现以上某条伏笔，也可以埋新的——但别让 active 列表无限增长。")
+        else:
+            lines.append("> 若本章涉及其中某条，请让它**在正文里真实发生**，不要只在对白里复述。")
+        lines.append("")
+
+    if bible.timeline:
+        lines.append("### 事件时间线（最近 5 条）")
+        for e in bible.timeline[-5:]:
+            lines.append(f"- {e}")
+        lines.append("")
+
+    if bible.paid_foreshadow:
+        lines.append(f"### 已兑现伏笔（{len(bible.paid_foreshadow)} 条）")
+        lines.append(f"（已处理：{'、'.join(bible.paid_foreshadow[:4])}{'...' if len(bible.paid_foreshadow) > 4 else ''}）")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ============ V3: bible_update prompt（LLM 增量抽取） ============
+BIBLE_UPDATE_SYSTEM = """你是世界观校对员。你的职责不是审美、不是润色，而是**抽取本章新增事实 + 校对和已有 bible 的一致性**。
+
+你读两份东西：
+1. 当前 WorldBible（前 N-1 章已确立的真相）
+2. 刚写完的第 N 章正文
+
+你输出一份 BibleUpdate：**只写增量**——新登场的人、新确立的规则、本章发生的大事、本章埋的新伏笔、本章兑现的旧伏笔。
+
+同时你要挑出**和 bible 矛盾的地方**（比如 bible 说某角色死了但本章他复活了；某规则被违反）。矛盾不是你修复——你只是指出来，让下一层决定怎么办。
+
+严禁：
+- 编造 bible 里不存在的"既有设定"
+- 重复已经在 bible 里的东西（只写增量）
+- 用华丽辞藻（bible 是工具不是文学）"""
+
+
+BIBLE_UPDATE_TASK = """## 任务
+从第 {chapter_idx} 章正文中抽取增量 BibleUpdate。
+
+## 当前 WorldBible（前 {prev_ch} 章累积）
+```json
+{bible_json}
+```
+
+## 第 {chapter_idx} 章 · 《{chapter_title}》正文
+```
+{chapter_content}
+```
+
+## 本章 L2 梗概（对照用）
+{l2_summary}
+伏笔埋：{foreshadow_planted}
+伏笔兑：{foreshadow_paid}
+
+## 要求
+1. `chapter_index` 填 {chapter_idx}
+2. `new_characters`：本章**首次登场**的角色。每个给 name/traits/arc_state/last_appeared_in={chapter_idx}
+3. `character_updates`：已在 bible 的角色，本章有新动向的。只填有变化的字段
+   - arc_state 更新（从"怀疑期"→"对峙期"之类）
+   - notable_events 追加本章发生的事（≤20 字/条）
+   - last_appeared_in = {chapter_idx}
+4. `new_facts`：本章确立的硬设定（规则 / 新场所 / 关键物件 / 关系）
+5. `timeline_additions`：本章大事年表一句话描述（≤25 字，如"主角在城隍庙对质父亲"）
+6. `new_foreshadow`：本章埋的、后面需要兑现的钩子（≤30 字/条）
+7. `paid_foreshadow`：本章兑现的、来自前面章节的伏笔——**字面要尽量匹配 bible.active_foreshadow 里的原文**，让下一层能精确移除
+8. `consistency_issues`：本章和 bible 矛盾的具体地方（如"bible 说 X 不会飞，本章 X 飞了"）。没有就空数组
+
+## 输出
+严格 JSON：
+
+```json
+{schema}
+```
+
+只写本章**真的新增/有变化的**条目。没变化的字段留空数组。
+"""
+
+
+def bible_update_prompt(state: NovelState, chapter_idx: int) -> str:
+    l3 = next(d for d in state.l3 if d.index == chapter_idx)
+    l2 = next(c for c in state.l2 if c.index == chapter_idx)
+    bible = state.world_bible or WorldBible()
+    planted = "；".join(l2.foreshadow_planted) if l2.foreshadow_planted else "（L2 未标注）"
+    paid = "；".join(l2.foreshadow_paid) if l2.foreshadow_paid else "（L2 未标注）"
+    return BIBLE_UPDATE_SYSTEM + "\n\n" + BIBLE_UPDATE_TASK.format(
+        chapter_idx=chapter_idx,
+        prev_ch=bible.last_updated_ch,
+        bible_json=bible.model_dump_json(indent=2),
+        chapter_title=l2.title,
+        chapter_content=l3.content,
+        l2_summary=l2.summary,
+        foreshadow_planted=planted,
+        foreshadow_paid=paid,
+        schema=schema_of(BibleUpdate),
+    )
 
 
 # ============ V2: Final-stage Audit ============

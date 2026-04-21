@@ -39,7 +39,15 @@ class TestUserInput:
         with pytest.raises(ValueError):
             UserInput(premise="t", chapter_count=0)
         with pytest.raises(ValueError):
-            UserInput(premise="t", chapter_count=20)
+            UserInput(premise="t", chapter_count=31)  # V3 升到 30 章上限
+
+    def test_v3_pipeline_opt_in(self):
+        ui = UserInput(premise="test", pipeline_version="v3")
+        assert ui.pipeline_version == "v3"
+
+    def test_chapter_count_v3_upper(self):
+        ui = UserInput(premise="t", chapter_count=20, pipeline_version="v3")
+        assert ui.chapter_count == 20
 
     def test_words_per_chapter_bounds(self):
         with pytest.raises(ValueError):

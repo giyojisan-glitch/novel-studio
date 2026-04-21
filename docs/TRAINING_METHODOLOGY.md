@@ -5,9 +5,9 @@
 
 ---
 
-## 1. 核心思路（三层创新）
+## 1. 核心思路（四层创新）
 
-对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在三个维度：
+对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在四个维度：
 
 ### 1.1 多层状态机（对标扩散模型）
 
@@ -53,6 +53,55 @@ premise → L1 骨架 → L2 章节梗概 → L3 段落正文 → (V2) L4 对抗
 ```
 
 核心优势：**同一套管道**，换不同的 inspirations/ 内容，就能产出不同作家味的小说 —— 不需要微调模型，不需要重训。
+
+### 1.4 V3 长篇架构：WorldBible + interleaved L2/L3
+
+**要解决的问题**：3-5 章单元测试能跑通，但开到 10+ 章时现有开源项目（包括 V2 NOVEL-Studio）都会崩：
+- 角色漂移：ch3 里主角恐高，ch7 他爬墙面不改色
+- 伏笔遗忘：ch1 的那把剑，ch5 再没出现过
+- 规则违反：L1 说「魔法必须付出代价」，ch8 主角免费释放了十次
+- 节奏失控：10 章的 setup-confrontation-resolution 需要 sub-beats 而不是笼统的三幕
+
+**V3 做法**：把「状态机 + 结构化知识」推到极致——不让 LLM 去"记住"前文，而是让系统把前文的真相以**结构化 bible** 的形式重新喂给它。
+
+```
+L1 骨架 → L1_audit → bible_init（synthetic，从 L1 抽出初始 bible）
+                ↓
+       对每章 i = 1..N 交替：
+         L2_i 梗概（prompt 注入 bible 全量：活跃角色的当前弧光、未兑现伏笔、硬规则）
+          ↓ audit
+         L3_i 正文（同样注入 bible + 上一章 actual tail）
+          ↓ audit
+         bible_update_i（LLM 读本章正文 → 产出 BibleUpdate 增量：
+                          new_characters / character_updates / new_facts /
+                          timeline_additions / new_foreshadow / paid_foreshadow /
+                          consistency_issues）
+          ↓
+         bible = apply_bible_update(bible, update)  [纯函数合并]
+                ↓
+       final_audit → L4_adversarial → L4_scrubber → 成品
+```
+
+**关键设计决策**：
+
+1. **interleaved 而不是"所有 L2 先出"**：V1/V2 里 L2 批量产出后才开始 L3。这对 3 章够用；对 10 章不够——ch2 outline 需要看到 ch1 **实际写了什么**，不只是 ch1 的 outline。V3 改成 L2_i → L3_i → bible_update_i → L2_{i+1}，链条里的每一步都能看到前面真实发生的事。
+
+2. **bible 是增量更新，不是每次重写**：`BibleUpdate` schema 里每个字段都是"本章**新增**的"——避免 LLM 每章把整份 bible 重写一遍（会遗忘、会矛盾、会爆 token）。合并逻辑在 Python 里做（`apply_bible_update`），确定性、可测、不依赖 LLM。
+
+3. **伏笔状态机**：`active_foreshadow` / `paid_foreshadow` 双列表显式追踪。每次 `bible_update` 产出 `paid_foreshadow`（从 active 移走的）和 `new_foreshadow`（新加到 active 的）。下一章 L2 prompt 里会看到 active 列表被明确提醒「可以考虑兑现」。
+
+4. **consistency_issues 是 fail-soft 而不是 hard blocker**：如果 bible_update 检测到本章和 bible 矛盾（「bible 说 X 不会飞，本章 X 飞了」），它只记录在 `consistency_issues` 字段里，不强制打回。未来可以用这个字段驱动定向重写，当前 V3 先让数据流跑通再优化修复机制。
+
+5. **bible_init 是合成步而不是 LLM 步**：从 L1 抽 bible 完全可以用 Python 规则做（主角→CharacterState，world_rules→WorldFact）。不浪费 LLM 调用，也确定性可测。
+
+**增加的 LLM 调用成本**：
+- V2 10 章 ≈ 1（L1）+ 1（L1_audit×2）+ 10（L2）+ 10（L2_audit×2）+ 10（L3）+ 10（L3_audit×2）+ 1（final_audit）+ 10（L4_adversarial）+ 10（L4_scrubber）≈ **63** 次调用
+- V3 10 章 ≈ 同 V2 + 10 次 bible_update = **73** 次调用（+15%）
+- 换来的是跨 10+ 章的**结构一致性**——性价比值
+
+**状态持久化**：`projects/{slug}/state.json` → `world_bible` 字段记录完整 bible，随时可查、可手动编辑、可作为 debug 入口（如果某章角色跑偏，查 bible 就能定位是 character_updates 错了还是 L3 脱缰）。
+
+**当前状态**（2026-04-21）：schema + 路由 + interleaved engine + stub smoke test 全绿，135 tests pass。真 LLM 10 章 run 是下一步的验证目标（预估 Doubao 一次跑完 40-50 分钟）。
 
 ---
 

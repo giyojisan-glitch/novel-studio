@@ -83,6 +83,25 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         "polish_notes": ["删除了某些 slop 词", "合并了重复段落"],
         "revision": 0,
     },
+    "_BIBLE_UPDATE_TEMPLATE": {
+        # chapter_index 由 _template_for 注入
+        "new_characters": [],
+        "character_updates": [
+            {
+                "name": "测试主角",
+                "traits": [],
+                "voice_markers": [],
+                "arc_state": "推进中",
+                "last_appeared_in": 0,  # 会被 idx 覆盖
+                "notable_events": ["测试事件"],
+            }
+        ],
+        "new_facts": [],
+        "timeline_additions": ["测试章节发生了测试事件"],
+        "new_foreshadow": [],
+        "paid_foreshadow": [],
+        "consistency_issues": [],
+    },
 }
 
 
@@ -134,6 +153,14 @@ class StubProvider(BaseProvider):
         if step_id.startswith("L4_scrubber_"):
             idx = int(step_id.split("_")[2])
             return {**dict(t["_L4_SCRUBBER_TEMPLATE"]), "index": idx}
+        if step_id.startswith("bible_update_"):
+            idx = int(step_id.split("_")[2])
+            base = dict(t["_BIBLE_UPDATE_TEMPLATE"])
+            # 深拷贝 character_updates 避免 stub 间共享
+            base["character_updates"] = [
+                {**c, "last_appeared_in": idx} for c in base["character_updates"]
+            ]
+            return {**base, "chapter_index": idx}
 
         # Audit：默认通过
         if step_id.endswith("_audit_logic"):

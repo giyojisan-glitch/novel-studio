@@ -14,15 +14,17 @@ AuditHead = Literal["logic", "pace", "style", "character"]
 class UserInput(BaseModel):
     premise: str
     genre: Genre = "科幻"
-    chapter_count: int = Field(3, ge=1, le=10)
+    chapter_count: int = Field(3, ge=1, le=30)
     target_words_per_chapter: int = Field(1000, ge=300, le=3000)
     language: Language = "zh"
     # 创意档位：strict（严格按 premise）/ balanced（平衡）/ creative（大胆补全）
     # 影响 temperature + 每层 prompt 里的创意自由度指令
     creativity: Creativity = "balanced"
-    # V2: pipeline 版本 —— v1 维持旧行为（L3 → finalize，L4 透传）
-    #                    v2 启用新管道（L3 → final_audit → L4_adversarial → L4_scrubber → finalize）
-    pipeline_version: Literal["v1", "v2"] = "v1"
+    # pipeline 版本：
+    #   v1 = 原始（L3 全部写完 → finalize，L4 透传）
+    #   v2 = V2 增强（L3 → final_audit → L4_adversarial → L4_scrubber → finalize）
+    #   v3 = V3 长篇（interleaved L2_i → L3_i → bible_update_i，世界观知识库维护跨章一致性）
+    pipeline_version: Literal["v1", "v2", "v3"] = "v1"
 
 
 class CharacterCard(BaseModel):
@@ -105,6 +107,51 @@ class AuditVerdict(BaseModel):
     retry_hint: str = ""
 
 
+# ============ V3: 世界观知识库（长篇一致性） ============
+class CharacterState(BaseModel):
+    """角色状态快照——跨章节追踪的动态字段。"""
+    name: str
+    traits: list[str] = Field(default_factory=list)            # 稳定特质
+    voice_markers: list[str] = Field(default_factory=list)     # 说话方式标记
+    arc_state: str = ""                                        # 当前弧光阶段（"怀疑期"/"觉醒期"）
+    last_appeared_in: int = 0                                  # 最后出场章节（0=未出场）
+    notable_events: list[str] = Field(default_factory=list)    # 已发生的关键事件
+
+
+class WorldFact(BaseModel):
+    """世界观事实条目——任何后续不能推翻的设定。"""
+    category: Literal["rule", "location", "item", "relationship", "event"]
+    content: str                                               # ≤60 字
+    ch_introduced: int                                         # 引入章节
+
+
+class WorldBible(BaseModel):
+    """V3 长篇专用：跨章节的真相账本。
+
+    - L1 产出后，bible_init 用 L1 数据初始化（角色+规则）
+    - 每章 L3 写完，bible_update_i 增量更新
+    - L2_{i+1} 和 L3_{i+1} 读 bible 获取跨章上下文
+    """
+    characters: list[CharacterState] = Field(default_factory=list)
+    facts: list[WorldFact] = Field(default_factory=list)
+    timeline: list[str] = Field(default_factory=list)            # 按时序的大事记
+    active_foreshadow: list[str] = Field(default_factory=list)   # 已埋未兑现的伏笔
+    paid_foreshadow: list[str] = Field(default_factory=list)     # 已兑现的伏笔
+    last_updated_ch: int = 0                                     # 最后一次 bible_update 覆盖到的章节
+
+
+class BibleUpdate(BaseModel):
+    """单次 bible_update 的产出：增量修改指令，而非整份 bible 重写。"""
+    chapter_index: int
+    new_characters: list[CharacterState] = Field(default_factory=list)
+    character_updates: list[CharacterState] = Field(default_factory=list)  # 已存在角色的状态更新
+    new_facts: list[WorldFact] = Field(default_factory=list)
+    timeline_additions: list[str] = Field(default_factory=list)
+    new_foreshadow: list[str] = Field(default_factory=list)      # 本章新埋的
+    paid_foreshadow: list[str] = Field(default_factory=list)     # 本章兑现的（要从 active 移除）
+    consistency_issues: list[str] = Field(default_factory=list)  # 与 bible 矛盾的地方（写给下次 L3 retry 的）
+
+
 class FinalVerdict(BaseModel):
     """V2: 成品审——对照 premise 原文审整本书，能抓跨层 bug（时间线/伏笔/角色坍塌）。"""
     usable: bool
@@ -130,7 +177,11 @@ class NovelState(BaseModel):
 
     audit_history: list[AuditVerdict] = Field(default_factory=list)
     final_verdict: Optional[FinalVerdict] = None             # V2: 成品审结果
-    cross_chapter_notes: list[str] = Field(default_factory=list)  # V3 预留
+    cross_chapter_notes: list[str] = Field(default_factory=list)  # 通用跨章备忘（legacy 字段，保留兼容）
+
+    # V3: 长篇专用——世界观知识库 + bible_update 指针
+    world_bible: Optional[WorldBible] = None
+    current_bible_update_idx: int = 0                        # 下一个要跑 bible_update 的章节（v3）
 
     next_step: str = "L1"
     completed: bool = False

@@ -246,6 +246,73 @@ class TestV1PipelineSmoke:
         assert len(state.final_markdown) > 0
 
 
+class TestDecideNextV3:
+    """V3 interleaved flow: L1 → L1_audit → bible_init → L2_1 → L2_1_audit → L3_1 → L3_1_audit → bible_update_1 → L2_2 → ..."""
+
+    def test_l1_audit_pass_v3_goes_to_bible_init(self):
+        s = _make_state("v3")
+        s.next_step = "L1_audit"
+        s.audit_history.append(_pass_verdict("L1"))
+        assert decide_next(s) == "bible_init"
+
+    def test_bible_init_goes_to_l2_1(self):
+        s = _make_state("v3")
+        s.next_step = "bible_init"
+        assert decide_next(s) == "L2_1"
+
+    def test_l2_audit_pass_v3_interleaves_to_l3_same_idx(self):
+        s = _make_state("v3", chapters=3)
+        s.l2 = [L2ChapterOutline(index=1, title="c1", summary="s", hook="h",
+                                 pov="p", key_events=["e"], prev_connection="pc")]
+        s.next_step = "L2_1_audit"
+        s.audit_history.append(_pass_verdict("L2", 1))
+        assert decide_next(s) == "L3_1"  # 不是 L2_2
+
+    def test_l3_audit_pass_v3_goes_to_bible_update(self):
+        s = _make_state("v3", chapters=3)
+        s.l3 = [L3ChapterDraft(index=1, content="x", word_count=1)]
+        s.next_step = "L3_1_audit"
+        s.audit_history.append(_pass_verdict("L3", 1))
+        assert decide_next(s) == "bible_update_1"
+
+    def test_bible_update_mid_chapter_goes_to_next_l2(self):
+        s = _make_state("v3", chapters=3)
+        s.next_step = "bible_update_2"
+        assert decide_next(s) == "L2_3"
+
+    def test_bible_update_last_chapter_goes_to_final_audit(self):
+        s = _make_state("v3", chapters=3)
+        s.next_step = "bible_update_3"
+        assert decide_next(s) == "final_audit"
+
+
+class TestV3PipelineSmoke:
+    """用 StubProvider 跑通 V3 pipeline（含 bible_init + 交替 L2/L3 + bible_update + final_audit + L4）。"""
+
+    def test_v3_full_run_completes(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v3", chapters=3)
+        provider = StubProvider()
+        for _ in range(200):
+            result = advance(state, pdir, provider=provider)
+            if result.get("status") == "completed":
+                break
+        assert state.completed is True
+        # V3: bible 必须被初始化 + 每章被更新
+        assert state.world_bible is not None
+        assert state.world_bible.last_updated_ch == 3
+        assert len(state.world_bible.timeline) == 3  # 每章一条 timeline
+        # trace 顺序验证：L3_1 必须出现在 L2_2 之前（interleaved）
+        steps_ran = [t["step"] for t in state.trace if "step" in t]
+        assert "bible_init" in steps_ran
+        assert "bible_update_1" in steps_ran and "bible_update_3" in steps_ran
+        l3_1_at = steps_ran.index("L3_1")
+        l2_2_at = steps_ran.index("L2_2")
+        assert l3_1_at < l2_2_at, f"interleaved expected: L3_1={l3_1_at} L2_2={l2_2_at}"
+        # V3 沿用 final_audit + L4 管道
+        assert state.final_verdict is not None
+        assert len(state.l4) == 3
+
+
 class TestV2PipelineSmoke:
     """用 StubProvider 跑通 V2 pipeline（含 final_audit + L4 adversarial + L4 scrubber）。"""
 

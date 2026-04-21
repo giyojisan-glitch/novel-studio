@@ -88,9 +88,10 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 - ✅ **Creativity parameter** (`strict` / `balanced` / `creative`) — routes both temperature (0.3/0.7/1.0) and prompt constraints per run
 - ✅ **Three LLM providers**: `human_queue` (Claude session responds), `anthropic` (Claude API), `doubao` (volcengine Coding Plan)
 - ✅ **Lora-style Inspiration RAG**: `inspirations/{author}/*.txt` → BAAI/bge-large-zh-v1.5 embeddings → Chroma → auto-injected into L3 prompts as style references. See [`docs/TRAINING_METHODOLOGY.md`](docs/TRAINING_METHODOLOGY.md) for A/B validation results.
+- ✅ **V3 long-form pipeline** (`--pipeline v3`): interleaved L2/L3 (each chapter outline sees the real prose of prior chapters) + **WorldBible** (per-chapter `bible_update` extracts new characters, facts, timeline events, and foreshadow state; bible is injected as context into subsequent L2/L3 prompts). Supports up to 30 chapters.
 - ✅ Artifacts export (every layer's output is human-readable)
 - ✅ CLI with init/step/status/artifacts/inspire commands
-- ✅ 126 unit tests green
+- ✅ 135 unit tests green
 
 ### A/B validated signals (see `docs/TRAINING_METHODOLOGY.md`)
 
@@ -101,8 +102,8 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 ### What's missing (and why it's hard)
 
 1. **Only 2 audit heads.** The original design has 4 (add character consistency + style).
-2. **Chapters are still sequential.** True parallel generation with shared blackboard state + a negotiation round is V3.
-3. **Long-form (novel-length) support.** Current stable output is 3-5 chapters × 1500-2500 words. Longer needs chapter negotiation + world bible.
+2. **V3 not yet battle-tested on real LLM at 10+ chapters.** Schema + routing + interleaving pass all stub tests; real-model 10-chapter run is the next empirical check.
+3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3 bible work and would stack on top.
 4. **Chinese-first.** Prompts and style packs are in Mandarin. Architecture is language-agnostic; porting is a translation task.
 5. **UX rough edges**: `step` doesn't remember the `--provider` chosen at `init`, must be passed each call.
 
@@ -190,10 +191,37 @@ uv run novel-studio init --file inputs/my_premise.md \
 # Or run free via Claude Code session (human_queue: you respond to prompts)
 uv run novel-studio init --file inputs/my_premise.md --genre 武侠 --chapters 3
 
+# V3 long-form (interleaved L2/L3 + WorldBible)
+uv run novel-studio init --file inputs/my_novel.md \
+    --genre 志怪 --chapters 10 --words 1500 \
+    --provider doubao --pipeline v3
+
 # Advance (for auto providers one call per stage):
 uv run novel-studio step projects/{timestamp}/ --provider doubao
 # Loop until 🎉 完成. Final novel in outputs/
 ```
+
+### V3 long-form pipeline
+
+`--pipeline v3` switches the engine from "write all outlines up front" to **interleaved per-chapter processing**:
+
+```
+L1  skeleton
+ └─ audit
+ └─ bible_init           (seed WorldBible from L1: characters, world rules, theme→foreshadow)
+ └─ for chapter i in 1..N:
+     L2_i outline        (gets full bible context: active characters, unpaid foreshadow, hard rules)
+      └─ audit
+     L3_i prose          (gets bible + last chapter's actual tail, not just outline)
+      └─ audit
+     bible_update_i      (LLM extracts: new characters, new facts, timeline events,
+                          paid foreshadow, new foreshadow, consistency issues)
+ └─ final_audit → L4_adversarial → L4_scrubber → finalize
+```
+
+**Why this beats sequential chains:** at chapter 7, L3 prompt sees a structured account of every character's current arc state, which rules are in force, which foreshadows still need paying off, and what actually happened in each prior chapter (not just outlines). Characters stop drifting; rules stop contradicting; foreshadow paying becomes explicit rather than accidental.
+
+The bible is append-only: each `bible_update_i` emits increments (`new_characters`, `character_updates`, `paid_foreshadow`, etc.), merged deterministically into state. You can inspect it at any time in `projects/{slug}/state.json` → `world_bible`.
 
 ### Seed the inspiration library (Lora-style style transfer)
 
