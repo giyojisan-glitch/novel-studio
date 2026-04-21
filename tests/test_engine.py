@@ -15,6 +15,7 @@ from novel_studio.state import (
     NovelState, UserInput, L1Skeleton, CharacterCard, ThreeAct,
     L2ChapterOutline, L3ChapterDraft, AuditReport, AuditVerdict,
     FinalVerdict, WorldBible, WorldFact, BibleUpdate,
+    SceneOutline, ChapterSceneList, L3SceneDraft, SceneCard,
 )
 from novel_studio.utils import save_state
 from novel_studio import prompts as P
@@ -414,6 +415,187 @@ class TestBugEFinalAuditHintInPrompts:
         drifted = [f for f in s.world_bible.facts if f.content == "drifted fact"]
         assert drifted == []
         assert s.current_bible_update_idx == 0
+
+
+class TestExpectedPromptsV4:
+    """V4 新 step 形式的 expected_prompts 路由。"""
+
+    def test_l25_single(self):
+        assert expected_prompts("L25_1") == ["L25_1"]
+
+    def test_l25_audit_two_heads(self):
+        assert expected_prompts("L25_2_audit") == ["L25_2_audit_logic", "L25_2_audit_pace"]
+
+    def test_l3_scene_single(self):
+        assert expected_prompts("L3_1_2") == ["L3_1_2"]
+
+    def test_l3_chapter_audit_three_heads(self):
+        """V4: 章节级审 = logic + pace + continuity。"""
+        expected = expected_prompts("L3_2_chapter_audit")
+        assert expected == [
+            "L3_2_chapter_audit_logic",
+            "L3_2_chapter_audit_pace",
+            "L3_2_chapter_audit_continuity",
+        ]
+
+
+class TestDecideNextV4:
+    """V4 interleaved + 场景分解路由：
+    L1 → L1_audit → bible_init → L2_1 → L2_1_audit → L25_1 → L25_1_audit
+        → L3_1_1 → L3_1_2 → ... → L3_1_chapter_audit → bible_update_1 → L2_2 → ...
+    """
+
+    def _v4_state(self, chapters=3):
+        s = _make_state("v4", chapters=chapters)
+        return s
+
+    def _add_scene_list(self, s, ch, n_scenes):
+        scenes = [SceneOutline(index=i, purpose="p", opening_beat="o",
+                                closing_beat="c", approximate_words=300)
+                  for i in range(1, n_scenes + 1)]
+        s.scene_lists.append(ChapterSceneList(chapter_index=ch, scenes=scenes))
+
+    def test_l1_audit_pass_goes_to_bible_init(self):
+        s = self._v4_state()
+        s.next_step = "L1_audit"
+        s.audit_history.append(_pass_verdict("L1"))
+        assert decide_next(s) == "bible_init"
+
+    def test_bible_init_goes_to_l2_1(self):
+        s = self._v4_state()
+        s.next_step = "bible_init"
+        assert decide_next(s) == "L2_1"
+
+    def test_l2_audit_pass_v4_goes_to_l25(self):
+        """v4: L2_i 过 → L25_i（而不是 L3_i 像 v3）。"""
+        s = self._v4_state()
+        s.l2 = [L2ChapterOutline(index=1, title="c1", summary="s", hook="h",
+                                 pov="p", key_events=["e"], prev_connection="pc")]
+        s.next_step = "L2_1_audit"
+        s.audit_history.append(_pass_verdict("L2", 1))
+        assert decide_next(s) == "L25_1"
+
+    def test_l25_goes_to_l25_audit(self):
+        s = self._v4_state()
+        s.next_step = "L25_1"
+        assert decide_next(s) == "L25_1_audit"
+
+    def test_l25_audit_pass_goes_to_first_scene(self):
+        s = self._v4_state()
+        self._add_scene_list(s, 1, 4)
+        s.next_step = "L25_1_audit"
+        s.audit_history.append(_pass_verdict("L25", 1))
+        assert decide_next(s) == "L3_1_1"
+
+    def test_l25_audit_fail_retries_l25(self):
+        s = self._v4_state()
+        self._add_scene_list(s, 1, 4)
+        s.next_step = "L25_1_audit"
+        s.audit_history.append(_fail_verdict("L25", 1))
+        assert decide_next(s) == "L25_1"
+        assert s.scene_lists[0].revision == 1
+
+    def test_scene_advances_to_next_scene(self):
+        s = self._v4_state()
+        self._add_scene_list(s, 1, 4)
+        s.next_step = "L3_1_2"
+        assert decide_next(s) == "L3_1_3"
+
+    def test_last_scene_advances_to_chapter_audit(self):
+        s = self._v4_state()
+        self._add_scene_list(s, 1, 3)       # 只有 3 场景
+        s.next_step = "L3_1_3"
+        assert decide_next(s) == "L3_1_chapter_audit"
+
+    def test_chapter_audit_pass_goes_to_bible_update(self):
+        s = self._v4_state()
+        self._add_scene_list(s, 1, 3)
+        s.l3_scenes = [L3SceneDraft(chapter_index=1, scene_index=i,
+                                     content="x", word_count=1) for i in range(1, 4)]
+        s.next_step = "L3_1_chapter_audit"
+        s.audit_history.append(AuditVerdict(
+            layer="L3", target_index=1,
+            reports=[AuditReport(head="logic", passed=True, score=0.85),
+                     AuditReport(head="pace", passed=True, score=0.75),
+                     AuditReport(head="continuity", passed=True, score=0.82)],
+            passed=True, retry_hint="",
+        ))
+        assert decide_next(s) == "bible_update_1"
+
+    def test_chapter_audit_fail_retries_all_scenes_from_1(self):
+        s = self._v4_state()
+        self._add_scene_list(s, 1, 3)
+        s.l3_scenes = [L3SceneDraft(chapter_index=1, scene_index=i,
+                                     content="x", word_count=1) for i in range(1, 4)]
+        s.next_step = "L3_1_chapter_audit"
+        s.audit_history.append(_fail_verdict("L3", 1))
+        assert decide_next(s) == "L3_1_1"
+        for sd in s.l3_scenes:
+            assert sd.revision == 1
+
+    def test_bible_update_v4_mid_chapter_goes_to_next_l2(self):
+        s = self._v4_state(chapters=3)
+        s.next_step = "bible_update_2"
+        assert decide_next(s) == "L2_3"
+
+    def test_bible_update_v4_last_chapter_goes_to_final_audit(self):
+        s = self._v4_state(chapters=3)
+        s.next_step = "bible_update_3"
+        assert decide_next(s) == "final_audit"
+
+
+class TestV4PipelineSmoke:
+    """StubProvider 跑完整 V4 pipeline：3 章 × 3 场景 = 9 个 L3_scene + 章节级 audit + bible_update + final_audit + L4。"""
+
+    def test_v4_full_run_completes(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v4", chapters=3)
+        provider = StubProvider()
+        for _ in range(500):
+            result = advance(state, pdir, provider=provider)
+            if result.get("status") == "completed":
+                break
+        assert state.completed, "v4 did not complete"
+
+        # L2.5: 每章一条 scene_lists
+        assert len(state.scene_lists) == 3, f"expected 3 scene_lists, got {len(state.scene_lists)}"
+        for csl in state.scene_lists:
+            assert len(csl.scenes) >= 2, f"ch{csl.chapter_index} scenes too few"
+
+        # L3 scenes: 每章 N 个（stub 模板是 3 个）
+        by_ch: dict[int, int] = {}
+        for sd in state.l3_scenes:
+            by_ch[sd.chapter_index] = by_ch.get(sd.chapter_index, 0) + 1
+        for ch in range(1, 4):
+            assert by_ch.get(ch, 0) == 3, f"ch{ch} scenes = {by_ch.get(ch, 0)}, expected 3"
+
+        # scene_cards: 和 l3_scenes 数量一致，且 actual_opening 被填
+        assert len(state.scene_cards) == 9
+        for card in state.scene_cards:
+            assert card.actual_opening != ""
+
+        # state.l3 被同步（章节级拼接）
+        assert len(state.l3) == 3
+        for d in state.l3:
+            assert d.word_count > 0
+
+        # bible 每章都被更新
+        assert state.world_bible is not None
+        assert state.world_bible.last_updated_ch == 3
+
+        # final_audit + L4 都跑了
+        assert state.final_verdict is not None
+        assert len(state.l4) == 3
+
+        # trace 顺序抽查：L3_1_1 在 L25_1_audit 之后，L3_1_chapter_audit 在 L3_1_3 之后
+        steps = [t["step"] for t in state.trace if "step" in t]
+        # 所有新 step 都出现过
+        assert any(s.startswith("L25_") and not s.endswith("audit") for s in steps)
+        assert "L3_1_1" in steps
+        assert "L3_1_chapter_audit" in steps
+        # 场景严格先于章节级 audit
+        assert steps.index("L3_1_3") < steps.index("L3_1_chapter_audit")
+        # bible_update 在 chapter_audit 之后
+        assert steps.index("L3_1_chapter_audit") < steps.index("bible_update_1")
 
 
 class TestDecideNextV3:

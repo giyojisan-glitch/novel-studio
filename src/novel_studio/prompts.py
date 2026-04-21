@@ -17,6 +17,10 @@ from .state import (
     BibleUpdate,
     CharacterState,
     WorldFact,
+    SceneOutline,
+    ChapterSceneList,
+    L3SceneDraft,
+    SceneCard,
 )
 
 
@@ -373,6 +377,14 @@ def audit_prompt(state: NovelState, layer: str, target_idx: int | None, head: st
         target = next(c for c in state.l2 if c.index == target_idx)
         desc = f"L2 第 {target_idx} 章梗概"
         ctx = {"l1": state.l1.model_dump()}
+    elif layer == "L25":
+        # V4: L2.5 场景列表审稿
+        target = next(x for x in state.scene_lists if x.chapter_index == target_idx)
+        desc = f"L2.5 第 {target_idx} 章场景列表"
+        ctx = {
+            "l1": state.l1.model_dump() if state.l1 else {},
+            "l2_for_chapter": next(c.model_dump() for c in state.l2 if c.index == target_idx),
+        }
     else:  # L3
         target = next(c for c in state.l3 if c.index == target_idx)
         desc = f"L3 第 {target_idx} 章正文"
@@ -994,4 +1006,41 @@ def scrubber_prompt(state: NovelState, chapter_idx: int) -> str:
         hook=l2.hook,
         schema=schema_of(L4PolishedChapter),
         revision=l4.revision if l4 else 0,
+    )
+
+
+# ============ V4: 场景分解层 + 多尺度连续性 ============
+# 本 commit 只落占位 prompt，让 stub 端到端能跑通；真实中文 prompt 在下个 commit。
+
+def l25_prompt(state: NovelState, chapter_idx: int) -> str:
+    """V4 L2.5：把 L2 梗概拆成 3-5 个场景。占位版。"""
+    l2 = next(c for c in state.l2 if c.index == chapter_idx)
+    return (
+        f"将第 {chapter_idx} 章的 L2 梗概拆解为 3-5 个场景。\n"
+        f"L2 梗概：{l2.summary}\nhook：{l2.hook}\n\n"
+        "输出 JSON 符合 ChapterSceneList schema：\n"
+        f"{schema_of(ChapterSceneList)}"
+    )
+
+
+def l3_scene_prompt(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
+    """V4 L3 单场景写作。占位版。"""
+    sl = next(x for x in state.scene_lists if x.chapter_index == chapter_idx)
+    outline = next(s for s in sl.scenes if s.index == scene_idx)
+    return (
+        f"写第 {chapter_idx} 章第 {scene_idx} 场景正文。\n"
+        f"场景设计：目的={outline.purpose}；开场={outline.opening_beat}；"
+        f"结尾={outline.closing_beat}；目标字数={outline.approximate_words}\n\n"
+        "输出 JSON 符合 L3SceneDraft schema：\n"
+        f"{schema_of(L3SceneDraft)}"
+    )
+
+
+def continuity_audit_prompt(state: NovelState, target_idx: int) -> str:
+    """V4 continuity 审头。占位版。"""
+    from .state import AuditReport
+    return (
+        f"检查第 {target_idx} 章的跨场景/跨章节连续性。"
+        "输出 AuditReport，head='continuity'。\n"
+        f"{schema_of(AuditReport)}"
     )

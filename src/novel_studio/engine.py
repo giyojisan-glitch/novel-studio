@@ -41,6 +41,9 @@ from .state import (
     AdversarialCut,
     FinalVerdict,
     BibleUpdate,
+    ChapterSceneList,
+    L3SceneDraft,
+    SceneCard,
 )
 from . import prompts as P
 from .audit import aggregate, should_force_pass, MAX_REVISION
@@ -65,13 +68,21 @@ DEFAULT_PROVIDER: BaseProvider = HumanQueueProvider()
 
 
 def expected_prompts(next_step: str) -> list[str]:
-    """next_step → 该步需要哪些 prompt 文件。audit 步有 2 个 head 并行；final_audit / L4_* / bible_update_* 是单个 prompt。"""
+    """next_step → 该步需要哪些 prompt 文件。audit 步有 2 或 3 个 head 并行；final_audit / L4_* / bible_update_* / L25_{i} / L3_{i}_{s} 是单个 prompt。"""
     if next_step in ("finalize", "DONE", "bible_init"):
         return []                                    # bible_init 为纯合成（无 LLM）
     if next_step == "final_audit":
         return ["final_audit"]
     if next_step.startswith(("L4_adversarial_", "L4_scrubber_", "bible_update_")):
         return [next_step]
+    # V4: L3_{i}_chapter_audit → 3 头（logic + pace + continuity）
+    if next_step.endswith("_chapter_audit"):
+        base = next_step[:-len("_chapter_audit")]
+        return [
+            f"{base}_chapter_audit_logic",
+            f"{base}_chapter_audit_pace",
+            f"{base}_chapter_audit_continuity",
+        ]
     if next_step.endswith("_audit"):
         base = next_step[:-len("_audit")]
         return [f"{base}_audit_logic", f"{base}_audit_pace"]
@@ -82,19 +93,30 @@ def build_prompt(state: NovelState, step_id: str) -> str:
     """根据 step_id 构造对应的 prompt 文本。"""
     if step_id == "L1":
         return P.l1_prompt(state)
-    if step_id.startswith("L2_") and not step_id.endswith(("_logic", "_pace")):
-        idx = int(step_id.split("_")[1])
-        return P.l2_prompt(state, idx)
-    if step_id.startswith("L3_") and not step_id.endswith(("_logic", "_pace")):
-        idx = int(step_id.split("_")[1])
-        return P.l3_prompt(state, idx)
-    if step_id.endswith("_audit_logic") or step_id.endswith("_audit_pace"):
-        head = "logic" if step_id.endswith("_logic") else "pace"
-        body = step_id.rsplit("_audit_", 1)[0]
-        if body == "L1":
-            return P.audit_prompt(state, "L1", None, head)
-        layer, idx_s = body.split("_", 1)
-        return P.audit_prompt(state, layer, int(idx_s), head)
+    parts = step_id.split("_")
+    # V4: L25_{i}（章节场景列表）— 要比 L2_ 早判断，避免「L25 也以 L2 开头」
+    if step_id.startswith("L25_") and not _is_audit_step(step_id):
+        if len(parts) == 2 and parts[1].isdigit():
+            return P.l25_prompt(state, int(parts[1]))
+    if step_id.startswith("L2_") and not _is_audit_step(step_id):
+        if len(parts) == 2 and parts[1].isdigit():
+            return P.l2_prompt(state, int(parts[1]))
+    # V4: L3_{i}_{s}（单场景正文）— 3 部分全是数字
+    if (step_id.startswith("L3_")
+        and not _is_audit_step(step_id)
+        and len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()):
+        return P.l3_scene_prompt(state, int(parts[1]), int(parts[2]))
+    # V1/V2/V3: L3_{i}（章节级正文）— 严格 2 部分
+    if step_id.startswith("L3_") and not _is_audit_step(step_id):
+        if len(parts) == 2 and parts[1].isdigit():
+            return P.l3_prompt(state, int(parts[1]))
+    if _is_audit_step(step_id):
+        head = _audit_head_of(step_id)
+        layer, idx = _parse_audit_target(step_id)
+        # V4 continuity 头有专门 prompt
+        if head == "continuity":
+            return P.continuity_audit_prompt(state, idx)
+        return P.audit_prompt(state, layer, idx, head)
     if step_id == "final_audit":
         full_md = export_markdown(state)
         slop_avg = _compute_slop_avg(state)
@@ -112,6 +134,20 @@ def build_prompt(state: NovelState, step_id: str) -> str:
         idx = int(step_id.split("_")[2])
         return P.bible_update_prompt(state, idx)
     raise ValueError(f"unknown step_id: {step_id}")
+
+
+def _is_audit_step(step_id: str) -> bool:
+    return step_id.endswith(("_audit_logic", "_audit_pace", "_audit_continuity"))
+
+
+def _audit_head_of(step_id: str) -> str:
+    if step_id.endswith("_audit_logic"):
+        return "logic"
+    if step_id.endswith("_audit_pace"):
+        return "pace"
+    if step_id.endswith("_audit_continuity"):
+        return "continuity"
+    raise ValueError(f"not an audit step: {step_id}")
 
 
 def _compute_slop_avg(state: NovelState) -> float:
@@ -140,14 +176,38 @@ def apply_responses(
     if len(step_ids) == 1:
         sid = step_ids[0]
         data = _fetch(sid)
+        parts = sid.split("_")
         if sid == "L1":
             state.l1 = L1Skeleton(**_coerce_dict(data, expected_index=None))
-        elif sid.startswith("L2_"):
-            idx = int(sid.split("_")[1])
+        elif sid.startswith("L25_") and len(parts) == 2 and parts[1].isdigit():
+            # V4: L25_{i} → ChapterSceneList
+            idx = int(parts[1])
+            csl = ChapterSceneList(**_coerce_dict(data, expected_index=None))
+            csl.chapter_index = idx
+            _upsert_scene_list(state, csl)
+            # 同时播种 SceneCards（设计部分，actual_* 留给 L3 写完后填）
+            for outline in csl.scenes:
+                _upsert_scene_card(state, SceneCard(
+                    chapter_index=idx, scene_index=outline.index, outline=outline,
+                ))
+        elif sid.startswith("L2_") and len(parts) == 2 and parts[1].isdigit():
+            idx = int(parts[1])
             outline = L2ChapterOutline(**_coerce_dict(data, expected_index=idx))
             _upsert_l2(state, outline)
-        elif sid.startswith("L3_"):
-            idx = int(sid.split("_")[1])
+        elif (sid.startswith("L3_") and len(parts) == 3
+              and parts[1].isdigit() and parts[2].isdigit()):
+            # V4: L3_{i}_{s} → L3SceneDraft + update SceneCard.actual_*
+            i, s = int(parts[1]), int(parts[2])
+            sd_data = _coerce_dict(data, expected_index=None)
+            sd = L3SceneDraft(**sd_data)
+            sd.chapter_index = i
+            sd.scene_index = s
+            _upsert_l3_scene(state, sd)
+            _fill_scene_card_actuals(state, i, s, sd.content)
+            # 每次场景写完就同步到 state.l3（最新的拼接），章节级 audit / final / L4 沿用
+            _sync_l3_from_scenes(state, i)
+        elif sid.startswith("L3_") and len(parts) == 2 and parts[1].isdigit():
+            idx = int(parts[1])
             draft = L3ChapterDraft(**_coerce_dict(data, expected_index=idx))
             _upsert_l3(state, draft)
         elif sid == "final_audit":
@@ -275,6 +335,57 @@ def _upsert_l4_polished(state: NovelState, polished: L4PolishedChapter) -> None:
     state.l4.sort(key=lambda p: p.index)
 
 
+def _upsert_scene_list(state: NovelState, csl: ChapterSceneList) -> None:
+    state.scene_lists = [x for x in state.scene_lists if x.chapter_index != csl.chapter_index] + [csl]
+    state.scene_lists.sort(key=lambda x: x.chapter_index)
+
+
+def _upsert_scene_card(state: NovelState, card: SceneCard) -> None:
+    state.scene_cards = [
+        c for c in state.scene_cards
+        if not (c.chapter_index == card.chapter_index and c.scene_index == card.scene_index)
+    ] + [card]
+    state.scene_cards.sort(key=lambda c: (c.chapter_index, c.scene_index))
+
+
+def _upsert_l3_scene(state: NovelState, sd: L3SceneDraft) -> None:
+    state.l3_scenes = [
+        s for s in state.l3_scenes
+        if not (s.chapter_index == sd.chapter_index and s.scene_index == sd.scene_index)
+    ] + [sd]
+    state.l3_scenes.sort(key=lambda s: (s.chapter_index, s.scene_index))
+
+
+def _fill_scene_card_actuals(state: NovelState, chapter_idx: int, scene_idx: int, content: str) -> None:
+    """L3 写完某场景后，把其首/尾 200 字填到对应 SceneCard。"""
+    for card in state.scene_cards:
+        if card.chapter_index == chapter_idx and card.scene_index == scene_idx:
+            card.actual_opening = content[:200]
+            card.actual_closing = content[-200:]
+            card.actual_word_count = len(content)
+            return
+
+
+def _sync_l3_from_scenes(state: NovelState, chapter_idx: int) -> None:
+    """V4: 把同章节所有 L3SceneDraft 拼接成 L3ChapterDraft，upsert 到 state.l3。
+
+    这样 chapter_audit / final_audit / L4 仍然按章节粒度工作，无需区分 v3/v4。
+    """
+    scenes = sorted(
+        [s for s in state.l3_scenes if s.chapter_index == chapter_idx],
+        key=lambda s: s.scene_index,
+    )
+    if not scenes:
+        return
+    content = "\n\n".join(s.content for s in scenes)
+    word_count = sum(s.word_count for s in scenes)
+    max_rev = max(s.revision for s in scenes)
+    draft = L3ChapterDraft(
+        index=chapter_idx, content=content, word_count=word_count, revision=max_rev,
+    )
+    _upsert_l3(state, draft)
+
+
 def _apply_bible_update_to_state(state: NovelState, update: BibleUpdate) -> None:
     """合并 BibleUpdate 到 state.world_bible。v3 专用。"""
     from .state import WorldBible
@@ -284,14 +395,32 @@ def _apply_bible_update_to_state(state: NovelState, update: BibleUpdate) -> None
 
 
 def _parse_audit_target(audit_step_id: str) -> tuple[str, int | None]:
+    """解析 audit step_id 到 (layer, target_index)。
+
+    支持形式：
+      L1_audit_{head}                    → ("L1", None)
+      L2_{i}_audit_{head}                → ("L2", i)
+      L25_{i}_audit_{head}               → ("L25", i)
+      L3_{i}_audit_{head}                → ("L3", i)        [V1/V2/V3 章节级]
+      L3_{i}_chapter_audit_{head}        → ("L3", i)        [V4 章节级，三头包含 continuity]
+    """
     body = audit_step_id.rsplit("_audit_", 1)[0]
     if body == "L1":
         return "L1", None
+    # V4: 剥掉 "_chapter" 后缀（如果是章节级审）
+    if body.endswith("_chapter"):
+        body = body[:-len("_chapter")]
     layer, idx_s = body.split("_", 1)
     return layer, int(idx_s)
 
 
 # ====== 决定下一步 ======
+
+
+def _scenes_in_chapter(state: NovelState, chapter_idx: int) -> int:
+    """V4：某章 L2.5 规划了多少个场景。"""
+    csl = next((x for x in state.scene_lists if x.chapter_index == chapter_idx), None)
+    return len(csl.scenes) if csl else 0
 
 
 def decide_next(state: NovelState) -> str:
@@ -300,9 +429,11 @@ def decide_next(state: NovelState) -> str:
     total = state.user_input.chapter_count
     v2 = state.user_input.pipeline_version == "v2"
     v3 = state.user_input.pipeline_version == "v3"
-    use_final_audit = v2 or v3  # v3 沿用 v2 的成品审 + L4 润色
+    v4 = state.user_input.pipeline_version == "v4"
+    use_final_audit = v2 or v3 or v4   # v4 沿用 v2 的成品审 + L4 润色
+    use_bible = v3 or v4                # v3/v4 共用世界观 bible
 
-    # bible_init 合成步完成 → 进 L2_1（不经 LLM）
+    # ---- 合成步完成 ----
     if cur == "bible_init":
         return "L2_1"
 
@@ -313,7 +444,7 @@ def decide_next(state: NovelState) -> str:
             return f"L2_{idx + 1}"
         return "final_audit" if use_final_audit else "finalize"
 
-    # V2/V3 共用：final_audit / L4 分支优先判断（避免被下面 `_audit` 后缀误捕）
+    # ---- V2/V3/V4 共用：final_audit / L4 分支 ----
     if cur == "final_audit":
         fv = state.final_verdict
         if fv and fv.usable:
@@ -329,15 +460,51 @@ def decide_next(state: NovelState) -> str:
             return f"L4_adversarial_{idx + 1}"
         return "finalize"
 
-    # 主 prompt 完成 → 进 audit（L1/L2/L3 共有行为）
+    parts = cur.split("_")
+
+    # ---- V4: L3_{i}_{s} 单场景完成 → 下一场景 / 章节级 audit ----
+    if (cur.startswith("L3_")
+        and len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()):
+        i, s = int(parts[1]), int(parts[2])
+        m = _scenes_in_chapter(state, i)
+        if s < m:
+            return f"L3_{i}_{s + 1}"
+        return f"L3_{i}_chapter_audit"
+
+    # ---- V4: L25_{i} / L25_{i}_audit ----
+    if cur.startswith("L25_") and len(parts) == 2 and parts[1].isdigit():
+        # L25_i 刚产出 → 进 audit
+        return f"{cur}_audit"
+
+    # ---- 主 prompt 完成 → 进 audit（L1/L2/L3 章节级） ----
     if cur == "L1":
         return "L1_audit"
-    if cur.startswith("L2_") and not cur.endswith("_audit"):
+    if cur.startswith("L2_") and len(parts) == 2 and parts[1].isdigit():
         return cur + "_audit"
-    if cur.startswith("L3_") and not cur.endswith("_audit"):
+    if cur.startswith("L3_") and len(parts) == 2 and parts[1].isdigit():
         return cur + "_audit"
 
-    # audit 完成 → 看 verdict（L1/L2/L3）
+    # ---- audit 完成 → 看 verdict ----
+    # V4 章节级 audit：形式 L3_{i}_chapter_audit
+    if cur.endswith("_chapter_audit"):
+        body = cur[:-len("_chapter_audit")]  # "L3_{i}"
+        verdict = state.audit_history[-1]
+        layer, idx_s = body.split("_", 1)
+        idx = int(idx_s)
+        # 用本章的 last scene revision 作为重写计数
+        scenes = [s for s in state.l3_scenes if s.chapter_index == idx]
+        current_rev = max((s.revision for s in scenes), default=0)
+        if verdict.passed or should_force_pass(current_rev):
+            # V4 沿用 v3 bible_update
+            return f"bible_update_{idx}" if use_bible else (
+                "final_audit" if (idx == total and use_final_audit)
+                else f"L2_{idx + 1}" if idx < total else "finalize"
+            )
+        # 重写整章所有场景：revision++，回到场景 1
+        for s in scenes:
+            s.revision += 1
+        return f"L3_{idx}_1"
+
     if cur.endswith("_audit"):
         body = cur[:-len("_audit")]
         verdict = state.audit_history[-1]
@@ -345,17 +512,27 @@ def decide_next(state: NovelState) -> str:
         if body == "L1":
             current_rev = state.l1.revision
             if verdict.passed or should_force_pass(current_rev):
-                # v3：先合成 bible_init，再进 L2_1
-                return "bible_init" if v3 else "L2_1"
+                # v3/v4：先合成 bible_init，再进 L2_1
+                return "bible_init" if use_bible else "L2_1"
             state.l1.revision += 1
             return "L1"
 
         layer, idx_s = body.split("_", 1)
         idx = int(idx_s)
+        if layer == "L25":
+            cur_csl = next(x for x in state.scene_lists if x.chapter_index == idx)
+            current_rev = cur_csl.revision
+            if verdict.passed or should_force_pass(current_rev):
+                return f"L3_{idx}_1"           # 开始写本章第 1 场景
+            cur_csl.revision += 1
+            return f"L25_{idx}"
         if layer == "L2":
             cur_outline = next(c for c in state.l2 if c.index == idx)
             current_rev = cur_outline.revision
             if verdict.passed or should_force_pass(current_rev):
+                # v4: L2_i 过了 → L25_i（场景分解）
+                if v4:
+                    return f"L25_{idx}"
                 # v3: interleaved —— L2_i 过了立即写 L3_i
                 if v3:
                     return f"L3_{idx}"
@@ -403,15 +580,18 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
     if fv is None:
         return "DONE"
     state.final_bounce_count += 1
-    v2_or_v3 = state.user_input.pipeline_version in ("v2", "v3")
+    pv = state.user_input.pipeline_version
+    has_l4 = pv in ("v2", "v3", "v4")
     if state.final_bounce_count > MAX_FINAL_BOUNCES:
         state.trace.append({
             "bounce": "force_pass_max_reached",
             "count": state.final_bounce_count,
             "hint": fv.retry_hint,
         })
-        return "L4_adversarial_1" if v2_or_v3 else "finalize"
-    v3 = state.user_input.pipeline_version == "v3"
+        return "L4_adversarial_1" if has_l4 else "finalize"
+    v3 = pv == "v3"
+    v4 = pv == "v4"
+    use_bible = v3 or v4
     s = fv.suspect_layer
     if s == "premise":
         state.trace.append({"bounce": "premise_unfixable", "hint": fv.retry_hint})
@@ -421,8 +601,12 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         state.l2.clear()
         state.l3.clear()
         state.l4.clear()
-        if v3:
-            # V3: L1 要重写，bible 要从头重建（下一轮 bible_init 会做）
+        if v4:
+            state.scene_lists.clear()
+            state.l3_scenes.clear()
+            state.scene_cards.clear()
+        if use_bible:
+            # V3/V4: L1 要重写，bible 要从头重建（下一轮 bible_init 会做）
             state.world_bible = None
             state.current_bible_update_idx = 0
         if state.l1:
@@ -432,8 +616,12 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         state.trace.append({"bounce": "to_L2_1", "hint": fv.retry_hint})
         state.l3.clear()
         state.l4.clear()
-        if v3 and state.l1:
-            # V3: L2 重写 → bible 重置到 post-L1 状态（抛掉后续 drifted facts）
+        if v4:
+            state.scene_lists.clear()
+            state.l3_scenes.clear()
+            state.scene_cards.clear()
+        if use_bible and state.l1:
+            # V3/V4: L2 重写 → bible 重置到 post-L1 状态（抛掉后续 drifted facts）
             state.world_bible = P.build_initial_bible(state.l1)
             state.current_bible_update_idx = 0
         for c in state.l2:
@@ -442,16 +630,28 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
     if s == "L3":
         state.trace.append({"bounce": "to_L3_1", "hint": fv.retry_hint})
         state.l4.clear()
-        if v3 and state.l1:
-            # V3: L3 重写 → bible 重置（否则旧版 drifted facts 会污染 retry 的 L3 prompt）
+        if v4:
+            # V4: L3 场景全部清掉（scene_lists 保留，因为 L2.5 没被 suspect）
+            for sd in state.l3_scenes:
+                sd.revision += 1
+            state.l3_scenes.clear()
+            # scene_cards actual_* 重置（保留 outline 部分）
+            for card in state.scene_cards:
+                card.actual_opening = ""
+                card.actual_closing = ""
+                card.actual_word_count = 0
+        if use_bible and state.l1:
+            # V3/V4: L3 重写 → bible 重置（否则旧版 drifted facts 会污染 retry 的 L3 prompt）
             state.world_bible = P.build_initial_bible(state.l1)
             state.current_bible_update_idx = 0
         for d in state.l3:
             d.revision += 1
+        if v4:
+            return "L3_1_1"          # V4: 从第 1 章第 1 场景重写
         return "L3_1"
     # L4 / none：没法有意义地退（L4 还没跑），直接放行
     state.trace.append({"bounce": "force_pass", "hint": fv.retry_hint})
-    return "L4_adversarial_1" if state.user_input.pipeline_version in ("v2", "v3") else "finalize"
+    return "L4_adversarial_1" if has_l4 else "finalize"
 
 
 # ====== 重试时清理对应 queue/response ======
@@ -589,9 +789,9 @@ def _do_bible_init(state: NovelState, pdir: Path, provider: BaseProvider) -> dic
 
 
 def _do_finalize(state: NovelState, pdir: Path) -> dict:
-    """finalize 步：不需 LLM，直接生成 MD。v2/v3 用 L4 内容，v1 用 L3。"""
-    has_l4_pipeline = state.user_input.pipeline_version in ("v2", "v3")
-    # v2/v3: L4 已经有实际 polished content；v1: 透传 L3
+    """finalize 步：不需 LLM，直接生成 MD。v2/v3/v4 用 L4 内容，v1 用 L3。"""
+    has_l4_pipeline = state.user_input.pipeline_version in ("v2", "v3", "v4")
+    # v2/v3/v4: L4 已经有实际 polished content；v1: 透传 L3
     if not has_l4_pipeline:
         state.l4 = [L4PolishedChapter(index=d.index, content=d.content) for d in state.l3]
     state.final_markdown = export_markdown(state)
@@ -612,9 +812,13 @@ def _is_retry(prev: str, new: str) -> bool:
     """新 next_step 是否是退回到上一层（重试）。"""
     if prev.endswith("_audit"):
         body = prev[:-len("_audit")]
+        # V4 章节级审：L3_{i}_chapter_audit → 重跑 L3_{i}_1
+        if body.endswith("_chapter"):
+            layer_idx = body[:-len("_chapter")]
+            return new == f"{layer_idx}_1"
         return body == new
-    # final_audit 的 bounce-back 也是重试
-    if prev == "final_audit" and new in ("L1", "L2_1", "L3_1"):
+    # final_audit 的 bounce-back 也是重试（含 V4 的 L3_1_1）
+    if prev == "final_audit" and new in ("L1", "L2_1", "L3_1", "L3_1_1"):
         return True
     return False
 
@@ -623,21 +827,49 @@ def _cleanup_retry_files(pdir: Path, state: NovelState, new_next: str) -> None:
     """根据 bounce 目标清理对应的 queue/response 文件。"""
     total = state.user_input.chapter_count
     targets: list[str] = []
+
+    def _l3_chapter_suffixes(ch: int) -> list[str]:
+        # V1/V2/V3 章节级 + V4 章节级 audit + V4 所有场景
+        out = [
+            f"L3_{ch}", f"L3_{ch}_audit_logic", f"L3_{ch}_audit_pace",
+            f"L3_{ch}_chapter_audit_logic",
+            f"L3_{ch}_chapter_audit_pace",
+            f"L3_{ch}_chapter_audit_continuity",
+        ]
+        # V4 场景：最多 8 个（schema 上限），清多了无害（文件不存在 unlink skip）
+        for s in range(1, 9):
+            out.append(f"L3_{ch}_{s}")
+        return out
+
+    def _l25_suffixes(ch: int) -> list[str]:
+        return [f"L25_{ch}", f"L25_{ch}_audit_logic", f"L25_{ch}_audit_pace"]
+
     if new_next == "L1":
         targets = ["L1", "L1_audit_logic", "L1_audit_pace"]
-        # 如果从 L1 重跑，所有 L2/L3 的队列也该清（state 已 clear 但文件可能遗留）
         for i in range(1, total + 1):
             targets += [f"L2_{i}", f"L2_{i}_audit_logic", f"L2_{i}_audit_pace"]
-            targets += [f"L3_{i}", f"L3_{i}_audit_logic", f"L3_{i}_audit_pace"]
+            targets += _l25_suffixes(i)
+            targets += _l3_chapter_suffixes(i)
     elif new_next == "L2_1":
         for i in range(1, total + 1):
             targets += [f"L2_{i}", f"L2_{i}_audit_logic", f"L2_{i}_audit_pace"]
-            targets += [f"L3_{i}", f"L3_{i}_audit_logic", f"L3_{i}_audit_pace"]
-    elif new_next == "L3_1":
+            targets += _l25_suffixes(i)
+            targets += _l3_chapter_suffixes(i)
+    elif new_next == "L3_1" or new_next == "L3_1_1":
         for i in range(1, total + 1):
-            targets += [f"L3_{i}", f"L3_{i}_audit_logic", f"L3_{i}_audit_pace"]
+            targets += _l3_chapter_suffixes(i)
     elif new_next in (f"L2_{i}" for i in range(1, total + 1)) or new_next in (f"L3_{i}" for i in range(1, total + 1)):
-        # 单章重写：只清自身 + 自身 audit
         targets = [new_next, f"{new_next}_audit_logic", f"{new_next}_audit_pace"]
+    elif new_next.startswith("L3_") and new_next.count("_") == 2:
+        # V4: L3_{i}_1（章节级重写）
+        parts = new_next.split("_")
+        if len(parts) == 3 and parts[1].isdigit() and parts[2] == "1":
+            ch = int(parts[1])
+            targets = _l3_chapter_suffixes(ch)
+    elif new_next.startswith("L25_"):
+        parts = new_next.split("_")
+        if len(parts) == 2 and parts[1].isdigit():
+            ch = int(parts[1])
+            targets = _l25_suffixes(ch) + _l3_chapter_suffixes(ch)
     if targets:
         reset_step_files(pdir, targets)
