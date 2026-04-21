@@ -288,6 +288,7 @@ def l1_prompt(state: NovelState) -> str:
             schema=schema_of(L1Skeleton),
         )
         + (f"\n\n## 上轮审稿反馈（请针对性修正）\n{retry}" if retry else "")
+        + _final_audit_retry_block(state)
     )
 
 
@@ -298,11 +299,13 @@ def l2_prompt(state: NovelState, chapter_idx: int) -> str:
     retry = _retry_hint(state, f"L2_{chapter_idx}")
     # V3: 如果启用了 bible（v3 pipeline），把跨章真相账本注入
     bible_block = _bible_context_block(state.world_bible, "L2") if _v3_active(state) else ""
+    final_audit_block = _final_audit_retry_block(state)
     return (
         _CREATIVITY_HEADER.get(state.user_input.creativity, "")
         + _lang_meta_header(state.user_input.language)
         + L2_SYSTEM
         + bible_block
+        + final_audit_block
         + "\n\n"
         + L2_TASK.format(
             chapter_idx=chapter_idx,
@@ -329,11 +332,15 @@ def l3_prompt(state: NovelState, chapter_idx: int) -> str:
     inspiration_block = _inspiration_few_shot(state, l2)
     # —— V3: 世界观 bible 注入（长篇跨章一致性） ——
     bible_block = _bible_context_block(state.world_bible, "L3") if _v3_active(state) else ""
+    # —— Bug E fix: 若本次写作是 final_audit bounce-back 的产物，注入成品审 retry_hint
+    #   （否则 LLM 根本看不到整本书视角的反馈，会重复同样的飘）——
+    final_audit_block = _final_audit_retry_block(state)
 
     return (
         l3_system_for(state.user_input.genre, state.user_input.language, state.user_input.creativity)
         + inspiration_block
         + bible_block
+        + final_audit_block
         + "\n\n"
         + L3_TASK.format(
             chapter_idx=chapter_idx,
@@ -473,6 +480,31 @@ def _v3_active(state: NovelState) -> bool:
     return state.user_input.pipeline_version == "v3"
 
 
+def _final_audit_retry_block(state: NovelState) -> str:
+    """若存在上一轮 final_audit 反馈（usable=False，退回到 L1/L2/L3），在 L2/L3 prompt 里注入。
+
+    这修的是 Bug E：之前 bounce-back 只清 state，但 final_verdict.retry_hint 这条"整本书层面"
+    的具体反馈没有流到下游 prompt → LLM 看不到问题、重写后同样飘。
+    """
+    fv = state.final_verdict
+    if fv is None or fv.usable:
+        return ""
+    if fv.suspect_layer not in ("L1", "L2", "L3"):
+        return ""
+    bounce_num = state.final_bounce_count
+    symptoms = "\n".join(f"- {s}" for s in fv.symptoms) if fv.symptoms else "（无具体症状）"
+    return (
+        "\n\n## ⚠️ 成品审反馈（整本书层面 · 必须修正 · 第 "
+        f"{bounce_num} 轮）\n"
+        f"**整本书在 final_audit 被打回，总分 {fv.overall_score:.2f}。问题：**\n"
+        f"{symptoms}\n\n"
+        f"**定向反馈**（直接针对本章写作）：\n"
+        f"> {fv.retry_hint}\n\n"
+        "⚠️ 这不是层级 audit 反馈（那是单章节奏/逻辑层面），是**整本书的系统性偏离**。"
+        "请严格按 premise 原文 + 上述反馈重写，不要沿用上一版的方向。"
+    )
+
+
 def _retry_hint(state: NovelState, step_key: str) -> str:
     v = state.last_audit(step_key)
     if v and not v.passed:
@@ -569,10 +601,23 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
         f for f in update.paid_foreshadow if f not in bible.paid_foreshadow
     ]
 
+    # V3 Bug C: facts 按 (category, content) 去重；timeline 按字面内容去重
+    # 原因：bounce-back 会重跑 bible_update，LLM 可能再抽一遍相同的事实，
+    # 导致 bible 膨胀（实测 214 条里 unique 只 39，5.5× 重复）
+    existing_fact_keys = {(f.category, f.content) for f in bible.facts}
+    deduped_new_facts = [
+        f for f in update.new_facts
+        if (f.category, f.content) not in existing_fact_keys
+    ]
+    existing_timeline = set(bible.timeline)
+    deduped_new_timeline = [
+        e for e in update.timeline_additions if e not in existing_timeline
+    ]
+
     return WorldBible(
         characters=list(chars_by_name.values()),
-        facts=list(bible.facts) + list(update.new_facts),
-        timeline=list(bible.timeline) + list(update.timeline_additions),
+        facts=list(bible.facts) + deduped_new_facts,
+        timeline=list(bible.timeline) + deduped_new_timeline,
         active_foreshadow=new_active,
         paid_foreshadow=new_paid,
         last_updated_ch=max(bible.last_updated_ch, update.chapter_index),

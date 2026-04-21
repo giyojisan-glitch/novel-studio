@@ -177,6 +177,7 @@ class NovelState(BaseModel):
 
     audit_history: list[AuditVerdict] = Field(default_factory=list)
     final_verdict: Optional[FinalVerdict] = None             # V2: 成品审结果
+    final_bounce_count: int = 0                              # V2/V3: 成品审被打回次数（防死循环，>=2 强制放行）
     cross_chapter_notes: list[str] = Field(default_factory=list)  # 通用跨章备忘（legacy 字段，保留兼容）
 
     # V3: 长篇专用——世界观知识库 + bible_update 指针

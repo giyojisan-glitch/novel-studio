@@ -178,14 +178,57 @@ def apply_responses(
         state.audit_history.append(verdict)
 
 
+def _looks_like_schema_envelope(data: dict) -> bool:
+    """识别"LLM 把自己的 JSON Schema 当成 response shape 返回"这个典型 bug。
+
+    症状（真实 Doubao final_audit 观察到）：
+        {
+          "type": "object",
+          "properties": {
+            "usable": {"type": "boolean", "value": false},
+            "overall_score": {"type": "number", "value": 0.3},
+            ...
+          },
+          "required": ["usable", "overall_score"]
+        }
+    正确的 shape 应该是 `{"usable": false, "overall_score": 0.3, ...}`。
+    """
+    return (
+        isinstance(data, dict)
+        and data.get("type") == "object"
+        and isinstance(data.get("properties"), dict)
+        and all(
+            isinstance(v, dict) and ("value" in v or "default" in v)
+            for v in data["properties"].values()
+        )
+    )
+
+
+def _unwrap_schema_envelope(data: dict) -> dict:
+    """把 {type/properties/required} 壳展平成 {field: value}。"""
+    out: dict = {}
+    for k, meta in data["properties"].items():
+        if not isinstance(meta, dict):
+            continue
+        if "value" in meta:
+            out[k] = meta["value"]
+        elif "default" in meta:
+            out[k] = meta["default"]
+    return out
+
+
 def _coerce_dict(data, expected_index: int | None) -> dict:
     """防御性容错：LLM 有时把单章 prompt 理解成"给我所有章节的列表"，返回 list 而不是 dict。
+    有时（Doubao 特别明显）把 JSON Schema 壳当响应返回，真数据藏在 properties.*.value。
 
     策略：
+    - JSON Schema 壳 → 剥壳
     - data 已是 dict：直接返回
     - data 是 list：找 index 匹配的那项；没有就取第一个 dict
     - 其他：raise
     """
+    if isinstance(data, dict) and _looks_like_schema_envelope(data):
+        return _unwrap_schema_envelope(data)
     if isinstance(data, dict):
         return data
     if isinstance(data, list):
@@ -342,6 +385,9 @@ def decide_next(state: NovelState) -> str:
     raise ValueError(f"unknown next_step: {cur}")
 
 
+MAX_FINAL_BOUNCES = 2  # 超过就强制放行，避免 LLM 重复给相同 retry_hint 的死循环
+
+
 def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
     """Final audit usable=False 时，退回到 suspect_layer。
 
@@ -351,9 +397,21 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
     - suspect=L2：清空 L3，从 L2_1 重跑
     - suspect=L3：从 L3_1 重跑（L2 保留）
     - suspect=L4 或 none：留在 final_audit，下一轮 final_audit
+    - **bounce 计数器**：每次进这里 +1，>= MAX_FINAL_BOUNCES 强制放行（避免 LLM 每次都
+      给同样的 retry_hint 导致无限循环）
     """
     if fv is None:
         return "DONE"
+    state.final_bounce_count += 1
+    v2_or_v3 = state.user_input.pipeline_version in ("v2", "v3")
+    if state.final_bounce_count > MAX_FINAL_BOUNCES:
+        state.trace.append({
+            "bounce": "force_pass_max_reached",
+            "count": state.final_bounce_count,
+            "hint": fv.retry_hint,
+        })
+        return "L4_adversarial_1" if v2_or_v3 else "finalize"
+    v3 = state.user_input.pipeline_version == "v3"
     s = fv.suspect_layer
     if s == "premise":
         state.trace.append({"bounce": "premise_unfixable", "hint": fv.retry_hint})
@@ -363,6 +421,10 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         state.l2.clear()
         state.l3.clear()
         state.l4.clear()
+        if v3:
+            # V3: L1 要重写，bible 要从头重建（下一轮 bible_init 会做）
+            state.world_bible = None
+            state.current_bible_update_idx = 0
         if state.l1:
             state.l1.revision += 1
         return "L1"
@@ -370,18 +432,26 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         state.trace.append({"bounce": "to_L2_1", "hint": fv.retry_hint})
         state.l3.clear()
         state.l4.clear()
+        if v3 and state.l1:
+            # V3: L2 重写 → bible 重置到 post-L1 状态（抛掉后续 drifted facts）
+            state.world_bible = P.build_initial_bible(state.l1)
+            state.current_bible_update_idx = 0
         for c in state.l2:
             c.revision += 1
         return "L2_1"
     if s == "L3":
         state.trace.append({"bounce": "to_L3_1", "hint": fv.retry_hint})
         state.l4.clear()
+        if v3 and state.l1:
+            # V3: L3 重写 → bible 重置（否则旧版 drifted facts 会污染 retry 的 L3 prompt）
+            state.world_bible = P.build_initial_bible(state.l1)
+            state.current_bible_update_idx = 0
         for d in state.l3:
             d.revision += 1
         return "L3_1"
     # L4 / none：没法有意义地退（L4 还没跑），直接放行
     state.trace.append({"bounce": "force_pass", "hint": fv.retry_hint})
-    return "L4_adversarial_1" if state.user_input.pipeline_version == "v2" else "finalize"
+    return "L4_adversarial_1" if state.user_input.pipeline_version in ("v2", "v3") else "finalize"
 
 
 # ====== 重试时清理对应 queue/response ======

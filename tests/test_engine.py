@@ -5,14 +5,19 @@ from pathlib import Path
 
 import pytest
 
-from novel_studio.engine import advance, expected_prompts, decide_next, _bounce_back
+from novel_studio.engine import (
+    advance, expected_prompts, decide_next, _bounce_back,
+    _coerce_dict, _looks_like_schema_envelope, _unwrap_schema_envelope,
+    MAX_FINAL_BOUNCES,
+)
 from novel_studio.llm import StubProvider
 from novel_studio.state import (
     NovelState, UserInput, L1Skeleton, CharacterCard, ThreeAct,
     L2ChapterOutline, L3ChapterDraft, AuditReport, AuditVerdict,
-    FinalVerdict,
+    FinalVerdict, WorldBible, WorldFact, BibleUpdate,
 )
 from novel_studio.utils import save_state
+from novel_studio import prompts as P
 
 
 def _make_state(pipeline: str = "v1", chapters: int = 3) -> NovelState:
@@ -246,6 +251,171 @@ class TestV1PipelineSmoke:
         assert len(state.final_markdown) > 0
 
 
+class TestBugASchemaEnvelope:
+    """Bug A 修复：Doubao 偶尔把自己的 JSON Schema 当响应返回，真数据藏在 properties.*.value。
+    _coerce_dict 现在会识别这种壳并剥壳。"""
+
+    def test_schema_envelope_detected(self):
+        envelope = {
+            "type": "object",
+            "properties": {
+                "usable": {"type": "boolean", "value": False},
+                "overall_score": {"type": "number", "value": 0.3},
+            },
+            "required": ["usable"],
+        }
+        assert _looks_like_schema_envelope(envelope) is True
+
+    def test_flat_dict_not_envelope(self):
+        flat = {"usable": True, "overall_score": 0.85}
+        assert _looks_like_schema_envelope(flat) is False
+
+    def test_unwrap_extracts_values(self):
+        envelope = {
+            "type": "object",
+            "properties": {
+                "usable": {"type": "boolean", "value": False},
+                "symptoms": {"type": "array", "value": ["bad1", "bad2"]},
+                "suspect_layer": {"type": "string", "default": "none", "value": "L3"},
+            },
+            "required": ["usable"],
+        }
+        out = _unwrap_schema_envelope(envelope)
+        assert out == {"usable": False, "symptoms": ["bad1", "bad2"], "suspect_layer": "L3"}
+
+    def test_coerce_dict_unwraps_envelope(self):
+        envelope = {
+            "type": "object",
+            "properties": {
+                "usable": {"value": True},
+                "overall_score": {"value": 0.8},
+            },
+        }
+        out = _coerce_dict(envelope, expected_index=None)
+        assert out == {"usable": True, "overall_score": 0.8}
+
+    def test_coerce_dict_flat_passthrough(self):
+        flat = {"usable": True, "overall_score": 0.8}
+        assert _coerce_dict(flat, expected_index=None) == flat
+
+
+class TestBugBFinalAuditBounceCap:
+    """Bug B 修复：final_audit 反复 bounce-back 会死循环（LLM 给相同 retry_hint）。
+    超过 MAX_FINAL_BOUNCES 强制放行。"""
+
+    def test_bounce_count_increments(self):
+        s = _make_state("v2")
+        assert s.final_bounce_count == 0
+        fv = FinalVerdict(usable=False, overall_score=0.3, suspect_layer="L3",
+                          retry_hint="fix X")
+        _bounce_back(s, fv)
+        assert s.final_bounce_count == 1
+
+    def test_force_pass_after_max(self):
+        s = _make_state("v2")
+        s.l2 = [L2ChapterOutline(index=1, title="c", summary="s", hook="h",
+                                 pov="p", key_events=["e"], prev_connection="pc")]
+        s.l3 = [L3ChapterDraft(index=1, content="a", word_count=1)]
+        fv = FinalVerdict(usable=False, overall_score=0.3, suspect_layer="L3",
+                          retry_hint="fix X")
+        # 连续 bounce 到超限
+        for _ in range(MAX_FINAL_BOUNCES):
+            target = _bounce_back(s, fv)
+            assert target == "L3_1", f"未超限应该正常 bounce，got {target}"
+        # 下一次必须强制放行
+        target = _bounce_back(s, fv)
+        assert target == "L4_adversarial_1"
+        # trace 里留痕
+        assert any(t.get("bounce") == "force_pass_max_reached" for t in s.trace)
+
+
+class TestBugCBibleDedup:
+    """Bug C 修复：apply_bible_update 会对 facts/timeline 去重，避免 bounce 后重复累积。"""
+
+    def test_facts_deduped_by_category_and_content(self):
+        bible = WorldBible(facts=[
+            WorldFact(category="rule", content="重复规则", ch_introduced=1),
+        ])
+        update = BibleUpdate(
+            chapter_index=2,
+            new_facts=[
+                WorldFact(category="rule", content="重复规则", ch_introduced=2),      # 重复
+                WorldFact(category="rule", content="新规则", ch_introduced=2),         # 新
+                WorldFact(category="item", content="重复规则", ch_introduced=2),       # 同 content 不同 category → 保留
+            ],
+        )
+        out = P.apply_bible_update(bible, update)
+        assert len(out.facts) == 3  # 1 老 + 2 新（category=rule 的"重复规则"被去重）
+        rule_contents = [f.content for f in out.facts if f.category == "rule"]
+        assert rule_contents.count("重复规则") == 1
+
+    def test_timeline_deduped(self):
+        bible = WorldBible(timeline=["事件A"])
+        update = BibleUpdate(
+            chapter_index=2,
+            timeline_additions=["事件A", "事件A", "事件B"],  # 3 条里 1 个全新
+        )
+        out = P.apply_bible_update(bible, update)
+        assert out.timeline == ["事件A", "事件B"]
+
+
+class TestBugEFinalAuditHintInPrompts:
+    """Bug E 修复：final_audit bounce-back 时，L1/L2/L3 prompt 能看到 final_verdict.retry_hint。"""
+
+    def test_l3_prompt_includes_final_hint_on_bounce(self):
+        s = _make_state("v3", chapters=3)
+        s.l2 = [L2ChapterOutline(index=1, title="c1", summary="s", hook="h",
+                                 pov="p", key_events=["e"], prev_connection="pc")]
+        s.l3 = [L3ChapterDraft(index=1, content="x", word_count=1)]
+        s.final_verdict = FinalVerdict(
+            usable=False, overall_score=0.3, suspect_layer="L3",
+            retry_hint="恢复亡父七天的核心设定；删除新增人物",
+            symptoms=["时间线矛盾", "新增角色"],
+        )
+        s.final_bounce_count = 1
+        prompt = P.l3_prompt(s, chapter_idx=1)
+        assert "成品审反馈" in prompt
+        assert "恢复亡父七天" in prompt
+        assert "时间线矛盾" in prompt
+
+    def test_l2_prompt_includes_final_hint_on_bounce(self):
+        s = _make_state("v3", chapters=3)
+        s.final_verdict = FinalVerdict(
+            usable=False, overall_score=0.4, suspect_layer="L2",
+            retry_hint="梗概缺少主线推进",
+        )
+        s.final_bounce_count = 1
+        prompt = P.l2_prompt(s, chapter_idx=1)
+        assert "成品审反馈" in prompt
+        assert "梗概缺少主线推进" in prompt
+
+    def test_l3_prompt_omits_final_hint_when_usable(self):
+        s = _make_state("v3", chapters=3)
+        s.l2 = [L2ChapterOutline(index=1, title="c1", summary="s", hook="h",
+                                 pov="p", key_events=["e"], prev_connection="pc")]
+        s.l3 = [L3ChapterDraft(index=1, content="x", word_count=1)]
+        s.final_verdict = FinalVerdict(usable=True, overall_score=0.85)
+        prompt = P.l3_prompt(s, chapter_idx=1)
+        assert "成品审反馈" not in prompt
+
+    def test_v3_bounce_l3_resets_bible(self):
+        """V3: L3 suspect → bounce 清 bible 回到 post-L1 状态（抛掉 drifted facts）。"""
+        s = _make_state("v3", chapters=3)
+        # 模拟已经被 drift 污染的 bible
+        s.world_bible = WorldBible(facts=[
+            WorldFact(category="rule", content="drifted fact", ch_introduced=5),
+        ])
+        s.current_bible_update_idx = 5
+        fv = FinalVerdict(usable=False, overall_score=0.3, suspect_layer="L3",
+                          retry_hint="x")
+        _bounce_back(s, fv)
+        # bible 应被重置到 post-L1 状态（只含 L1 的 world_rules）
+        assert s.world_bible is not None
+        drifted = [f for f in s.world_bible.facts if f.content == "drifted fact"]
+        assert drifted == []
+        assert s.current_bible_update_idx == 0
+
+
 class TestDecideNextV3:
     """V3 interleaved flow: L1 → L1_audit → bible_init → L2_1 → L2_1_audit → L3_1 → L3_1_audit → bible_update_1 → L2_2 → ..."""
 
@@ -300,7 +470,9 @@ class TestV3PipelineSmoke:
         # V3: bible 必须被初始化 + 每章被更新
         assert state.world_bible is not None
         assert state.world_bible.last_updated_ch == 3
-        assert len(state.world_bible.timeline) == 3  # 每章一条 timeline
+        # 注意：stub 每章 bible_update 返回相同 timeline 字符串，
+        # apply_bible_update 有 dedup → 只保留 1 条。真 LLM 每章会产出不同内容。
+        assert len(state.world_bible.timeline) >= 1
         # trace 顺序验证：L3_1 必须出现在 L2_2 之前（interleaved）
         steps_ran = [t["step"] for t in state.trace if "step" in t]
         assert "bible_init" in steps_ran
