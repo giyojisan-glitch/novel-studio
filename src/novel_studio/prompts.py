@@ -21,6 +21,7 @@ from .state import (
     ChapterSceneList,
     L3SceneDraft,
     SceneCard,
+    TrackedObject,
 )
 
 
@@ -586,6 +587,12 @@ def build_initial_bible(l1: L1Skeleton) -> WorldBible:
         active_foreshadow.append(f"主角须学会：{l1.protagonist.need}")
     if l1.protagonist.wound:
         active_foreshadow.append(f"主角创伤未愈：{l1.protagonist.wound}")
+    # V5: 从 L1 copy 视觉锚点 + 初始化追踪物件（零 LLM 调用）
+    visual_anchors = list(l1.visual_anchors)
+    tracked_objects = [
+        TrackedObject(name=n, current_state="初始 / 未使用", last_changed_ch=0)
+        for n in l1.tracked_object_names
+    ]
     return WorldBible(
         characters=characters,
         facts=facts,
@@ -593,6 +600,10 @@ def build_initial_bible(l1: L1Skeleton) -> WorldBible:
         active_foreshadow=active_foreshadow,
         paid_foreshadow=[],
         last_updated_ch=0,
+        visual_anchors=visual_anchors,
+        tracked_objects=tracked_objects,
+        fulfilled_anchors=[],
+        time_markers_used=[],
     )
 
 
@@ -647,6 +658,50 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
         e for e in update.timeline_additions if e not in existing_timeline
     ]
 
+    # V5: tracked_objects 按 name 更新（新状态覆盖旧；state_history 追加）
+    objs_by_name = {o.name: o for o in bible.tracked_objects}
+    for change in update.object_state_changes:
+        existing = objs_by_name.get(change.name)
+        if existing:
+            new_history = list(existing.state_history) + [
+                f"ch{update.chapter_index}: {change.current_state}"
+            ]
+            objs_by_name[change.name] = TrackedObject(
+                name=change.name,
+                current_state=change.current_state,
+                last_changed_ch=update.chapter_index,
+                state_history=new_history,
+            )
+        else:
+            # 新追加（通常 L1 已 declare，但兜底）
+            objs_by_name[change.name] = TrackedObject(
+                name=change.name,
+                current_state=change.current_state,
+                last_changed_ch=update.chapter_index,
+                state_history=[f"ch{update.chapter_index}: {change.current_state}"],
+            )
+
+    # V5: character_status_changes 覆盖角色 status/reliability（其余字段不动）
+    for status_change in update.character_status_changes:
+        if status_change.name in chars_by_name:
+            existing = chars_by_name[status_change.name]
+            chars_by_name[status_change.name] = CharacterState(
+                name=existing.name,
+                traits=existing.traits,
+                voice_markers=existing.voice_markers,
+                arc_state=existing.arc_state,
+                last_appeared_in=existing.last_appeared_in,
+                notable_events=existing.notable_events,
+                status=status_change.status,
+                reliability=status_change.reliability,
+            )
+
+    # V5: 已兑现 anchors 追加（去重）
+    existing_fulfilled = set(bible.fulfilled_anchors)
+    new_fulfilled = list(bible.fulfilled_anchors) + [
+        a for a in update.visual_anchors_fulfilled if a not in existing_fulfilled
+    ]
+
     return WorldBible(
         characters=list(chars_by_name.values()),
         facts=list(bible.facts) + deduped_new_facts,
@@ -654,6 +709,10 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
         active_foreshadow=new_active,
         paid_foreshadow=new_paid,
         last_updated_ch=max(bible.last_updated_ch, update.chapter_index),
+        visual_anchors=list(bible.visual_anchors),                # 只从 L1 来，此处不改
+        tracked_objects=list(objs_by_name.values()),
+        fulfilled_anchors=new_fulfilled,
+        time_markers_used=list(bible.time_markers_used),          # engine 在 L25 apply 时维护
     )
 
 

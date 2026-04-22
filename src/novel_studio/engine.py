@@ -44,6 +44,7 @@ from .state import (
     ChapterSceneList,
     L3SceneDraft,
     SceneCard,
+    TrackedObject,
 )
 from . import prompts as P
 from .audit import aggregate, should_force_pass, MAX_REVISION
@@ -190,6 +191,13 @@ def apply_responses(
                 _upsert_scene_card(state, SceneCard(
                     chapter_index=idx, scene_index=outline.index, outline=outline,
                 ))
+            # V5: 把本章 time_markers append 到 bible.time_markers_used（按场景顺序）
+            if state.world_bible is not None:
+                new_markers = [s.time_marker for s in csl.scenes if s.time_marker]
+                if new_markers:
+                    state.world_bible.time_markers_used = (
+                        list(state.world_bible.time_markers_used) + new_markers
+                    )
         elif sid.startswith("L2_") and len(parts) == 2 and parts[1].isdigit():
             idx = int(parts[1])
             outline = L2ChapterOutline(**_coerce_dict(data, expected_index=idx))
@@ -212,6 +220,20 @@ def apply_responses(
             _upsert_l3(state, draft)
         elif sid == "final_audit":
             state.final_verdict = FinalVerdict(**_coerce_dict(data, expected_index=None))
+            # V5: unfulfilled_anchors 非空 → 强制 usable=False 和 suspect=L3
+            # （LLM 可能错误标 usable=True 却漏掉 visual_anchor 兑现检查）
+            if state.final_verdict.unfulfilled_anchors:
+                state.final_verdict.usable = False
+                if state.final_verdict.suspect_layer == "none":
+                    state.final_verdict.suspect_layer = "L3"
+                # 把未兑现锚点明确写进 retry_hint
+                unfulfilled_str = "；".join(state.final_verdict.unfulfilled_anchors)
+                addendum = f"[V5 视觉锚点未兑现] {unfulfilled_str}"
+                if addendum not in state.final_verdict.retry_hint:
+                    state.final_verdict.retry_hint = (
+                        state.final_verdict.retry_hint + "\n" + addendum
+                        if state.final_verdict.retry_hint else addendum
+                    )
         elif sid.startswith("L4_adversarial_"):
             idx = int(sid.split("_")[2])
             # L4_adversarial 本身就预期 list（AdversarialCut 数组）
@@ -427,11 +449,12 @@ def decide_next(state: NovelState) -> str:
     """根据 state 当前状况返回下一个 step。"""
     cur = state.next_step
     total = state.user_input.chapter_count
-    v2 = state.user_input.pipeline_version == "v2"
-    v3 = state.user_input.pipeline_version == "v3"
-    v4 = state.user_input.pipeline_version == "v4"
-    use_final_audit = v2 or v3 or v4   # v4 沿用 v2 的成品审 + L4 润色
-    use_bible = v3 or v4                # v3/v4 共用世界观 bible
+    pv = state.user_input.pipeline_version
+    v2 = pv == "v2"
+    v3 = pv == "v3"
+    v4 = pv in ("v4", "v5")              # V5 沿用 V4 路由（+ V5 新增 prompt 注入而已）
+    use_final_audit = v2 or v3 or v4      # v4/v5 沿用 v2 的成品审 + L4 润色
+    use_bible = v3 or v4                   # v3/v4/v5 共用世界观 bible
 
     # ---- 合成步完成 ----
     if cur == "bible_init":
@@ -581,7 +604,7 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         return "DONE"
     state.final_bounce_count += 1
     pv = state.user_input.pipeline_version
-    has_l4 = pv in ("v2", "v3", "v4")
+    has_l4 = pv in ("v2", "v3", "v4", "v5")
     if state.final_bounce_count > MAX_FINAL_BOUNCES:
         state.trace.append({
             "bounce": "force_pass_max_reached",
@@ -590,7 +613,7 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         })
         return "L4_adversarial_1" if has_l4 else "finalize"
     v3 = pv == "v3"
-    v4 = pv == "v4"
+    v4 = pv in ("v4", "v5")            # V5 沿用 V4 的 bounce 清理逻辑
     use_bible = v3 or v4
     s = fv.suspect_layer
     if s == "premise":
@@ -790,7 +813,7 @@ def _do_bible_init(state: NovelState, pdir: Path, provider: BaseProvider) -> dic
 
 def _do_finalize(state: NovelState, pdir: Path) -> dict:
     """finalize 步：不需 LLM，直接生成 MD。v2/v3/v4 用 L4 内容，v1 用 L3。"""
-    has_l4_pipeline = state.user_input.pipeline_version in ("v2", "v3", "v4")
+    has_l4_pipeline = state.user_input.pipeline_version in ("v2", "v3", "v4", "v5")
     # v2/v3/v4: L4 已经有实际 polished content；v1: 透传 L3
     if not has_l4_pipeline:
         state.l4 = [L4PolishedChapter(index=d.index, content=d.content) for d in state.l3]

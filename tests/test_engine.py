@@ -16,6 +16,7 @@ from novel_studio.state import (
     L2ChapterOutline, L3ChapterDraft, AuditReport, AuditVerdict,
     FinalVerdict, WorldBible, WorldFact, BibleUpdate,
     SceneOutline, ChapterSceneList, L3SceneDraft, SceneCard,
+    TrackedObject, CharacterState,
 )
 from novel_studio.utils import save_state
 from novel_studio import prompts as P
@@ -542,6 +543,133 @@ class TestDecideNextV4:
         s = self._v4_state(chapters=3)
         s.next_step = "bible_update_3"
         assert decide_next(s) == "final_audit"
+
+
+class TestV5BibleMerge:
+    """V5: build_initial_bible + apply_bible_update 的 V5 字段合并。"""
+
+    def _make_l1(self, visual_anchors=None, tracked=None):
+        return L1Skeleton(
+            title="T", logline="l", theme="t",
+            protagonist=CharacterCard(name="沈砚", traits=["书生"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+            visual_anchors=visual_anchors or [],
+            tracked_object_names=tracked or [],
+        )
+
+    def test_build_initial_bible_copies_visual_anchors(self):
+        l1 = self._make_l1(visual_anchors=["泥塑裂纹", "三碗见底"])
+        bible = P.build_initial_bible(l1)
+        assert bible.visual_anchors == ["泥塑裂纹", "三碗见底"]
+        assert bible.fulfilled_anchors == []
+
+    def test_build_initial_bible_seeds_tracked_objects(self):
+        l1 = self._make_l1(tracked=["三碗酒", "半块木牌"])
+        bible = P.build_initial_bible(l1)
+        assert len(bible.tracked_objects) == 2
+        assert bible.tracked_objects[0].name == "三碗酒"
+        assert bible.tracked_objects[0].current_state == "初始 / 未使用"
+
+    def test_apply_bible_update_updates_tracked_object_state(self):
+        l1 = self._make_l1(tracked=["三碗酒"])
+        bible = P.build_initial_bible(l1)
+        update = BibleUpdate(
+            chapter_index=3,
+            object_state_changes=[TrackedObject(name="三碗酒", current_state="左碗裂")],
+        )
+        new_bible = P.apply_bible_update(bible, update)
+        obj = next(o for o in new_bible.tracked_objects if o.name == "三碗酒")
+        assert obj.current_state == "左碗裂"
+        assert obj.last_changed_ch == 3
+        assert "ch3: 左碗裂" in obj.state_history
+
+    def test_apply_bible_update_character_status_change(self):
+        l1 = self._make_l1()
+        bible = P.build_initial_bible(l1)   # 沈砚 in bible.characters
+        update = BibleUpdate(
+            chapter_index=5,
+            character_status_changes=[
+                CharacterState(name="沈砚", status="fading", reliability=0.5),
+            ],
+        )
+        new_bible = P.apply_bible_update(bible, update)
+        shen = next(c for c in new_bible.characters if c.name == "沈砚")
+        assert shen.status == "fading"
+        assert shen.reliability == 0.5
+        # 原有的 traits / arc_state 不应被覆盖
+        assert shen.traits == ["书生"]
+
+    def test_apply_bible_update_fulfilled_anchors_accumulate(self):
+        l1 = self._make_l1(visual_anchors=["A", "B", "C"])
+        bible = P.build_initial_bible(l1)
+        update_a = BibleUpdate(chapter_index=1, visual_anchors_fulfilled=["A"])
+        bible = P.apply_bible_update(bible, update_a)
+        assert bible.fulfilled_anchors == ["A"]
+        update_b = BibleUpdate(chapter_index=2, visual_anchors_fulfilled=["B"])
+        bible = P.apply_bible_update(bible, update_b)
+        assert bible.fulfilled_anchors == ["A", "B"]
+        # 重复报告不累加
+        update_dup = BibleUpdate(chapter_index=3, visual_anchors_fulfilled=["A", "C"])
+        bible = P.apply_bible_update(bible, update_dup)
+        assert bible.fulfilled_anchors == ["A", "B", "C"]
+
+
+class TestV5FinalAuditEnforcement:
+    """V5: unfulfilled_anchors 非空 → 强制 usable=False + suspect=L3。"""
+
+    def test_unfulfilled_anchors_forces_not_usable(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v5", chapters=1)
+        provider = StubProvider(overrides={
+            "final_audit": {
+                "usable": True,                              # LLM 说 OK
+                "overall_score": 0.9,
+                "symptoms": [],
+                "suspect_layer": "none",
+                "retry_hint": "",
+                "slop_avg": 0.5,
+                "unfulfilled_anchors": ["锚点 X 未兑现"],       # 但 V5 强制 flag
+            },
+        })
+        # 模拟已经到 final_audit 步
+        state.next_step = "final_audit"
+        from novel_studio.engine import apply_responses
+        provider.request("final_audit", "dummy", pdir)
+        apply_responses(state, ["final_audit"], pdir, provider=provider)
+        assert state.final_verdict.usable is False          # 强制翻转
+        assert state.final_verdict.suspect_layer == "L3"
+        assert "锚点 X 未兑现" in state.final_verdict.retry_hint
+
+    def test_empty_unfulfilled_keeps_usable_as_is(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v5", chapters=1)
+        provider = StubProvider()   # 默认 unfulfilled_anchors=[]
+        state.next_step = "final_audit"
+        from novel_studio.engine import apply_responses
+        provider.request("final_audit", "dummy", pdir)
+        apply_responses(state, ["final_audit"], pdir, provider=provider)
+        assert state.final_verdict.usable is True  # 默认 stub 返 True
+
+
+class TestV5PipelineSmoke:
+    """StubProvider 跑 V5 pipeline · 3 章 × 3 场景（V5 沿用 V4 路由）。"""
+
+    def test_v5_full_run_populates_v5_bible_fields(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v5", chapters=3)
+        provider = StubProvider()
+        for _ in range(300):
+            result = advance(state, pdir, provider=provider)
+            if result.get("status") == "completed":
+                break
+        assert state.completed
+
+        # V5 bible 字段都要填：
+        assert state.world_bible is not None
+        # 来自 L1 stub 模板的 visual_anchors / tracked_object_names
+        assert state.world_bible.visual_anchors == ["测试视觉锚点 A", "测试视觉锚点 B"]
+        # bible_init 生成的 2 个 tracked_objects
+        assert len(state.world_bible.tracked_objects) == 2
+        # 每章 L25 stub 模板有 3 个 time_markers，3 章共 9 条（allowing duplicates)
+        assert len(state.world_bible.time_markers_used) >= 3
 
 
 class TestSceneMultiScaleContext:
