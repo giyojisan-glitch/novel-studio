@@ -263,33 +263,72 @@ def apply_responses(
 def _looks_like_schema_envelope(data: dict) -> bool:
     """识别"LLM 把自己的 JSON Schema 当成 response shape 返回"这个典型 bug。
 
-    症状（真实 Doubao final_audit 观察到）：
-        {
-          "type": "object",
-          "properties": {
-            "usable": {"type": "boolean", "value": false},
-            "overall_score": {"type": "number", "value": 0.3},
-            ...
-          },
-          "required": ["usable", "overall_score"]
-        }
-    正确的 shape 应该是 `{"usable": false, "overall_score": 0.3, ...}`。
+    两种已知 Doubao 形态：
+
+    Shape A（V4 final_audit 观察到 · 数据塞在 value 里）：
+        {"type": "object",
+         "properties": {
+           "usable": {"type": "boolean", "value": false},
+           "overall_score": {"type": "number", "value": 0.3}
+         },
+         "required": ["usable", ...]}
+
+    Shape B（V4 L25 观察到 · 纯 schema、无数据）：
+        {"$defs": {...},
+         "properties": {
+           "chapter_index": {"type": "integer"},
+           "scenes": {"type": "array", "items": {...}}
+         },
+         "required": ["chapter_index", ...]}
+
+    正确 shape 应该是扁平 `{"field": value, ...}`。
     """
-    return (
-        isinstance(data, dict)
-        and data.get("type") == "object"
-        and isinstance(data.get("properties"), dict)
-        and all(
-            isinstance(v, dict) and ("value" in v or "default" in v)
-            for v in data["properties"].values()
-        )
+    if not isinstance(data, dict):
+        return False
+    props = data.get("properties")
+    if not isinstance(props, dict) or not props:
+        return False
+
+    # Shape A：每个 property 都有 value 或 default（数据被嵌入 schema）
+    if all(
+        isinstance(v, dict) and ("value" in v or "default" in v)
+        for v in props.values()
+    ):
+        return True
+
+    # Shape B：纯 schema，properties 条目全是 schema-like（有 type，没 value）
+    has_schema_sibling = (
+        "$defs" in data or "required" in data or data.get("type") == "object"
     )
+    schema_like_props = all(
+        isinstance(v, dict) and "type" in v and "value" not in v
+        for v in props.values()
+    )
+    return has_schema_sibling and schema_like_props
 
 
 def _unwrap_schema_envelope(data: dict) -> dict:
-    """把 {type/properties/required} 壳展平成 {field: value}。"""
+    """把 {type/properties/required} 壳展平成 {field: value}。
+
+    Shape A：有 value/default → 提取
+    Shape B：纯 schema 无数据 → raise ValueError 触发上游重跑
+    """
+    props = data["properties"]
+    # Shape A detection
+    has_data = any(
+        isinstance(v, dict) and ("value" in v or "default" in v)
+        for v in props.values()
+    )
+    if not has_data:
+        # Shape B：doubao 把 schema 本身当响应返回，根本没数据
+        raise ValueError(
+            "Doubao 返回了纯 JSON Schema 壳（$defs/properties/required）"
+            "但没有实际字段值。原因通常是 prompt 里的 {schema} 让模型"
+            "以为要补全 schema 而不是按 schema 产出数据。请删除对应 "
+            "responses/<step_id>.response.json 文件后重跑 step 让 Doubao 重新生成。"
+        )
     out: dict = {}
-    for k, meta in data["properties"].items():
+    for k, meta in props.items():
         if not isinstance(meta, dict):
             continue
         if "value" in meta:

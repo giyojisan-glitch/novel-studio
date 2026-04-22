@@ -258,6 +258,7 @@ class TestBugASchemaEnvelope:
     _coerce_dict 现在会识别这种壳并剥壳。"""
 
     def test_schema_envelope_detected(self):
+        # Shape A：data 塞在 value 里
         envelope = {
             "type": "object",
             "properties": {
@@ -299,6 +300,49 @@ class TestBugASchemaEnvelope:
     def test_coerce_dict_flat_passthrough(self):
         flat = {"usable": True, "overall_score": 0.8}
         assert _coerce_dict(flat, expected_index=None) == flat
+
+    # ---------- Bug A 扩展：Shape B（V4 L25 观察到的纯 schema 壳） ----------
+
+    def test_shape_b_defs_envelope_detected(self):
+        """Shape B：doubao 返回纯 schema（有 $defs/properties/required，无 value）。"""
+        shape_b = {
+            "$defs": {"SceneOutline": {"type": "object"}},
+            "properties": {
+                "chapter_index": {"type": "integer"},
+                "scenes": {"type": "array", "items": {"$ref": "#/$defs/SceneOutline"}},
+            },
+            "required": ["chapter_index", "scenes"],
+        }
+        assert _looks_like_schema_envelope(shape_b) is True
+
+    def test_shape_b_required_only_detected(self):
+        """有 required + schema-like properties，无 $defs / type=object，仍识别为 Shape B。"""
+        shape_b = {
+            "properties": {"usable": {"type": "boolean"}, "score": {"type": "number"}},
+            "required": ["usable"],
+        }
+        assert _looks_like_schema_envelope(shape_b) is True
+
+    def test_shape_b_unwrap_raises_with_actionable_hint(self):
+        """Shape B 无数据 → _unwrap_schema_envelope 应 raise 且消息含"删除 response"提示。"""
+        shape_b = {
+            "$defs": {},
+            "properties": {"chapter_index": {"type": "integer"}, "scenes": {"type": "array"}},
+            "required": ["chapter_index"],
+        }
+        with pytest.raises(ValueError) as excinfo:
+            _unwrap_schema_envelope(shape_b)
+        assert "Schema 壳" in str(excinfo.value) or "schema" in str(excinfo.value).lower()
+        assert "删除" in str(excinfo.value) or "删" in str(excinfo.value)
+
+    def test_coerce_dict_raises_on_shape_b(self):
+        """_coerce_dict 对 Shape B 也应 raise（通过 _unwrap_schema_envelope）。"""
+        shape_b = {
+            "properties": {"chapter_index": {"type": "integer"}},
+            "required": ["chapter_index"],
+        }
+        with pytest.raises(ValueError):
+            _coerce_dict(shape_b, expected_index=None)
 
 
 class TestBugBFinalAuditBounceCap:
