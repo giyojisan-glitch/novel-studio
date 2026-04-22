@@ -42,6 +42,8 @@ class CharacterCard(BaseModel):
     # V2: Wound/Want/Need/Lie 框架（autonovel/CRAFT.md）
     wound: str = ""                         # 角色的心理创伤/过去经历
     lie: str = ""                           # 角色相信的谎言（need 的反面）
+    # V6: 阵营（解决多股势力角色身份混淆）
+    faction: str = ""                       # 「顾府」/「沈家」/「官方」等自由文本
 
 
 class ThreeAct(BaseModel):

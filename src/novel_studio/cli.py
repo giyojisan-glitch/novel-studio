@@ -397,11 +397,12 @@ def main():
     p_init.add_argument("--force", action="store_true", help="绕过 premise 长度检查")
     p_init.add_argument("--v2", action="store_true",
                         help="[legacy] 等价于 --pipeline v2")
-    p_init.add_argument("--pipeline", default=None, choices=["v1", "v2", "v3", "v4", "v5"],
+    p_init.add_argument("--pipeline", default=None, choices=["v1", "v2", "v3", "v4", "v5", "v6"],
                         help="pipeline 版本：v1（基础） / v2（+final_audit+L4 润色） / "
                              "v3（+长篇 WorldBible+interleaved L2/L3） / "
                              "v4（+L2.5 场景分解+多尺度 context+continuity 审头） / "
-                             "v5（+visual_anchors+time_markers+tracked_objects+character status，**推荐长篇成品**）")
+                             "v5（+visual_anchors+time_markers+tracked_objects+character status） / "
+                             "v6（+plot_promises+faction+technical_setup/payoff，**推荐长篇成品**）")
     p_init.add_argument("--scenes-per-chapter", type=int, default=4,
                         help="V4 专用：每章场景数软目标（默认 4，LLM 可在 3-5 范围浮动）")
     p_init.add_argument("--creativity", default="balanced",

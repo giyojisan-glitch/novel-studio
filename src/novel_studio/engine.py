@@ -234,6 +234,18 @@ def apply_responses(
                         state.final_verdict.retry_hint + "\n" + addendum
                         if state.final_verdict.retry_hint else addendum
                     )
+            # V6: unfulfilled_promises 同样强制 bounce（叙事承诺未兑现）
+            if state.final_verdict.unfulfilled_promises:
+                state.final_verdict.usable = False
+                if state.final_verdict.suspect_layer == "none":
+                    state.final_verdict.suspect_layer = "L3"
+                promises_str = "；".join(state.final_verdict.unfulfilled_promises)
+                addendum = f"[V6 叙事承诺未兑现] {promises_str}"
+                if addendum not in state.final_verdict.retry_hint:
+                    state.final_verdict.retry_hint = (
+                        state.final_verdict.retry_hint + "\n" + addendum
+                        if state.final_verdict.retry_hint else addendum
+                    )
         elif sid.startswith("L4_adversarial_"):
             idx = int(sid.split("_")[2])
             # L4_adversarial 本身就预期 list（AdversarialCut 数组）
@@ -523,7 +535,7 @@ def decide_next(state: NovelState) -> str:
     pv = state.user_input.pipeline_version
     v2 = pv == "v2"
     v3 = pv == "v3"
-    v4 = pv in ("v4", "v5")              # V5 沿用 V4 路由（+ V5 新增 prompt 注入而已）
+    v4 = pv in ("v4", "v5", "v6")              # V5 沿用 V4 路由（+ V5 新增 prompt 注入而已）
     use_final_audit = v2 or v3 or v4      # v4/v5 沿用 v2 的成品审 + L4 润色
     use_bible = v3 or v4                   # v3/v4/v5 共用世界观 bible
 
@@ -675,7 +687,7 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         return "DONE"
     state.final_bounce_count += 1
     pv = state.user_input.pipeline_version
-    has_l4 = pv in ("v2", "v3", "v4", "v5")
+    has_l4 = pv in ("v2", "v3", "v4", "v5", "v6")
     if state.final_bounce_count > MAX_FINAL_BOUNCES:
         state.trace.append({
             "bounce": "force_pass_max_reached",
@@ -684,7 +696,7 @@ def _bounce_back(state: NovelState, fv: FinalVerdict | None) -> str:
         })
         return "L4_adversarial_1" if has_l4 else "finalize"
     v3 = pv == "v3"
-    v4 = pv in ("v4", "v5")            # V5 沿用 V4 的 bounce 清理逻辑
+    v4 = pv in ("v4", "v5", "v6")            # V5 沿用 V4 的 bounce 清理逻辑
     use_bible = v3 or v4
     s = fv.suspect_layer
     if s == "premise":

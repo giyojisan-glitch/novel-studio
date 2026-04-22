@@ -840,6 +840,142 @@ class TestV5PipelineSmoke:
         assert len(state.world_bible.time_markers_used) >= 3
 
 
+class TestV6BibleMerge:
+    """V6: build_initial_bible 从 L1 copy plot_promises；apply_bible_update 维护
+    promise.setup_ch / payoff_ch / fulfilled。"""
+
+    def test_build_initial_copies_plot_promises(self):
+        from novel_studio.state import PlotPromise, L1Skeleton, CharacterCard, ThreeAct
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="沈清", traits=[], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=[],
+            plot_promises=[
+                PlotPromise(id="fs_1", content="埋下三颗死子"),
+                PlotPromise(id="fs_2", content="揭露构陷证据"),
+            ],
+        )
+        bible = P.build_initial_bible(l1)
+        assert len(bible.plot_promises) == 2
+        assert bible.plot_promises[0].id == "fs_1"
+        assert bible.plot_promises[0].fulfilled is False
+
+    def test_build_initial_propagates_faction_from_character_card(self):
+        from novel_studio.state import L1Skeleton, CharacterCard, ThreeAct
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="沈清", traits=[], want="w", need="n",
+                                       faction="沈家"),
+            antagonist=CharacterCard(name="顾衍之", traits=[], want="w", need="n",
+                                      faction="顾府"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=[],
+        )
+        bible = P.build_initial_bible(l1)
+        shen = next(c for c in bible.characters if c.name == "沈清")
+        gu = next(c for c in bible.characters if c.name == "顾衍之")
+        assert shen.faction == "沈家"
+        assert gu.faction == "顾府"
+
+    def test_apply_bible_update_marks_promise_setup(self):
+        from novel_studio.state import PlotPromise, WorldBible, BibleUpdate
+        bible = WorldBible(plot_promises=[
+            PlotPromise(id="fs_1", content="埋死子"),
+            PlotPromise(id="fs_2", content="引爆"),
+        ])
+        update = BibleUpdate(chapter_index=2, promise_setups_done=["fs_1"])
+        new_bible = P.apply_bible_update(bible, update)
+        fs1 = next(p for p in new_bible.plot_promises if p.id == "fs_1")
+        fs2 = next(p for p in new_bible.plot_promises if p.id == "fs_2")
+        assert fs1.setup_ch == 2
+        assert fs1.fulfilled is False
+        assert fs2.setup_ch == 0  # 其他 promise 不动
+
+    def test_apply_bible_update_marks_payoff_fulfilled(self):
+        from novel_studio.state import PlotPromise, WorldBible, BibleUpdate
+        bible = WorldBible(plot_promises=[
+            PlotPromise(id="fs_1", content="埋死子", setup_ch=1),
+        ])
+        update = BibleUpdate(chapter_index=5, promise_payoffs_done=["fs_1"])
+        new_bible = P.apply_bible_update(bible, update)
+        fs1 = next(p for p in new_bible.plot_promises if p.id == "fs_1")
+        assert fs1.payoff_ch == 5
+        assert fs1.fulfilled is True
+        assert fs1.setup_ch == 1  # 原 setup_ch 不被覆盖
+
+    def test_apply_bible_update_unknown_promise_id_ignored(self):
+        from novel_studio.state import PlotPromise, WorldBible, BibleUpdate
+        bible = WorldBible(plot_promises=[PlotPromise(id="fs_1", content="X")])
+        update = BibleUpdate(chapter_index=2,
+                             promise_setups_done=["fs_unknown"],
+                             promise_payoffs_done=["also_unknown"])
+        new_bible = P.apply_bible_update(bible, update)
+        # 原 fs_1 不动
+        assert new_bible.plot_promises[0].id == "fs_1"
+        assert new_bible.plot_promises[0].setup_ch == 0
+
+    def test_apply_bible_update_preserves_faction_on_character_update(self):
+        from novel_studio.state import CharacterState, WorldBible, BibleUpdate
+        bible = WorldBible(characters=[
+            CharacterState(name="沈清", faction="沈家", arc_state="起点"),
+        ])
+        update = BibleUpdate(chapter_index=2, character_updates=[
+            CharacterState(name="沈清", arc_state="觉醒", last_appeared_in=2),  # 没填 faction
+        ])
+        new_bible = P.apply_bible_update(bible, update)
+        shen = next(c for c in new_bible.characters if c.name == "沈清")
+        assert shen.faction == "沈家"           # 保留原 faction
+        assert shen.arc_state == "觉醒"
+
+
+class TestV6FinalAuditEnforcement:
+    """V6: unfulfilled_promises 非空 → 强制 usable=False + suspect=L3。"""
+
+    def test_unfulfilled_promises_forces_not_usable(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v6", chapters=1)
+        provider = StubProvider(overrides={
+            "final_audit": {
+                "usable": True,
+                "overall_score": 0.9,
+                "symptoms": [],
+                "suspect_layer": "none",
+                "retry_hint": "",
+                "slop_avg": 0.5,
+                "unfulfilled_anchors": [],
+                "unfulfilled_promises": ["fs_3 死子未引爆"],
+            },
+        })
+        state.next_step = "final_audit"
+        from novel_studio.engine import apply_responses
+        provider.request("final_audit", "dummy", pdir)
+        apply_responses(state, ["final_audit"], pdir, provider=provider)
+        assert state.final_verdict.usable is False
+        assert state.final_verdict.suspect_layer == "L3"
+        assert "fs_3 死子未引爆" in state.final_verdict.retry_hint
+
+
+class TestV6PipelineSmoke:
+    """StubProvider 跑 V6 pipeline · 验证 V6 字段流转。"""
+
+    def test_v6_full_run_populates_plot_promises_in_bible(self, tmp_path):
+        state, pdir = _setup_project(tmp_path, pipeline="v6", chapters=3)
+        provider = StubProvider()
+        for _ in range(300):
+            result = advance(state, pdir, provider=provider)
+            if result.get("status") == "completed":
+                break
+        assert state.completed
+
+        # L1 stub 模板定义了 2 条 plot_promises → bible 应 copy 到
+        assert state.world_bible is not None
+        assert len(state.world_bible.plot_promises) == 2
+        assert state.world_bible.plot_promises[0].id == "fs_1"
+        # V6 字段结构完整
+        assert state.final_verdict is not None
+        assert state.final_verdict.unfulfilled_promises == []
+
+
 class TestSceneMultiScaleContext:
     """V4: _scene_multi_scale_context 在不同场景位置上产出正确的多尺度 context。"""
 

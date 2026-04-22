@@ -650,6 +650,7 @@ def build_initial_bible(l1: L1Skeleton) -> WorldBible:
         traits=list(l1.protagonist.traits),
         arc_state="起点：尚未觉察 need",
         last_appeared_in=0,
+        faction=getattr(l1.protagonist, "faction", ""),
     ))
     if l1.antagonist:
         characters.append(CharacterState(
@@ -657,6 +658,7 @@ def build_initial_bible(l1: L1Skeleton) -> WorldBible:
             traits=list(l1.antagonist.traits),
             arc_state="起点：立场已定",
             last_appeared_in=0,
+            faction=getattr(l1.antagonist, "faction", ""),
         ))
     facts: list[WorldFact] = [
         WorldFact(category="rule", content=r, ch_introduced=0)
@@ -674,6 +676,8 @@ def build_initial_bible(l1: L1Skeleton) -> WorldBible:
         TrackedObject(name=n, current_state="初始 / 未使用", last_changed_ch=0)
         for n in l1.tracked_object_names
     ]
+    # V6: 从 L1 copy 叙事承诺（保留 setup_ch/payoff_ch 如已预设）
+    plot_promises = [p.model_copy() for p in l1.plot_promises]
     return WorldBible(
         characters=characters,
         facts=facts,
@@ -685,6 +689,7 @@ def build_initial_bible(l1: L1Skeleton) -> WorldBible:
         tracked_objects=tracked_objects,
         fulfilled_anchors=[],
         time_markers_used=[],
+        plot_promises=plot_promises,
     )
 
 
@@ -716,6 +721,10 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
                 arc_state=c.arc_state or existing.arc_state,
                 last_appeared_in=max(c.last_appeared_in, existing.last_appeared_in),
                 notable_events=merged_events,
+                status=existing.status,
+                reliability=existing.reliability,
+                # V6: 保留原 faction，除非更新项显式提供
+                faction=c.faction or existing.faction,
             )
         else:
             chars_by_name[c.name] = c
@@ -775,6 +784,7 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
                 notable_events=existing.notable_events,
                 status=status_change.status,
                 reliability=status_change.reliability,
+                faction=status_change.faction or existing.faction,
             )
         else:
             # 新角色且直接标为 fading/gone（容错：LLM 没先用 new_characters 加）
@@ -785,6 +795,24 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
     new_fulfilled = list(bible.fulfilled_anchors) + [
         a for a in update.visual_anchors_fulfilled if a not in existing_fulfilled
     ]
+
+    # V6: plot_promises 账本维护
+    # - promise_setups_done: 把 promise.setup_ch 置为 update.chapter_index（如果还没设）
+    # - promise_payoffs_done: 把 promise.payoff_ch 置为 update.chapter_index + fulfilled=True
+    promises_by_id = {p.id: p.model_copy() for p in bible.plot_promises}
+    for pid in update.promise_setups_done:
+        if pid in promises_by_id:
+            p = promises_by_id[pid]
+            if p.setup_ch == 0:
+                p.setup_ch = update.chapter_index
+    for pid in update.promise_payoffs_done:
+        if pid in promises_by_id:
+            p = promises_by_id[pid]
+            p.payoff_ch = update.chapter_index
+            p.fulfilled = True
+            # 若本章同时 setup 未标，补上（LLM 可能漏报）
+            if p.setup_ch == 0:
+                p.setup_ch = update.chapter_index
 
     return WorldBible(
         characters=list(chars_by_name.values()),
@@ -797,6 +825,7 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
         tracked_objects=list(objs_by_name.values()),
         fulfilled_anchors=new_fulfilled,
         time_markers_used=list(bible.time_markers_used),          # engine 在 L25 apply 时维护
+        plot_promises=list(promises_by_id.values()),
     )
 
 
