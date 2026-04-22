@@ -20,6 +20,10 @@ from novel_studio.state import (
     ChapterSceneList,
     L3SceneDraft,
     SceneCard,
+    TrackedObject,
+    CharacterState,
+    WorldBible,
+    BibleUpdate,
 )
 
 
@@ -69,6 +73,10 @@ class TestUserInput:
             UserInput(premise="t", pipeline_version="v4", scenes_per_chapter_hint=1)
         with pytest.raises(ValueError):
             UserInput(premise="t", pipeline_version="v4", scenes_per_chapter_hint=9)
+
+    def test_v5_pipeline_opt_in(self):
+        ui = UserInput(premise="test", pipeline_version="v5")
+        assert ui.pipeline_version == "v5"
 
 
 # ---------- V4: SceneOutline / ChapterSceneList / L3SceneDraft / SceneCard ----------
@@ -306,3 +314,116 @@ class TestNovelStateRoundtrip:
 def pipeline_version_is_v1(self):
     return self.user_input.pipeline_version == "v1"
 NovelState.pipeline_version_is_v1 = pipeline_version_is_v1
+
+
+# ---------- V5: premise 忠实度字段 ----------
+
+
+class TestV5Schema:
+    def test_tracked_object_basic(self):
+        t = TrackedObject(name="三碗酒", current_state="初始满碗",
+                          last_changed_ch=1, state_history=["ch1: 满"])
+        assert t.name == "三碗酒"
+        assert t.last_changed_ch == 1
+        assert t.state_history == ["ch1: 满"]
+
+    def test_tracked_object_defaults(self):
+        t = TrackedObject(name="木牌", current_state="初始")
+        assert t.last_changed_ch == 0
+        assert t.state_history == []
+
+    def test_l1_visual_anchors_and_tracked_names(self):
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="p", traits=["a"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+            visual_anchors=["泥塑裂纹", "三碗酒同时见底"],
+            tracked_object_names=["三碗酒", "木牌"],
+        )
+        assert l1.visual_anchors == ["泥塑裂纹", "三碗酒同时见底"]
+        assert l1.tracked_object_names == ["三碗酒", "木牌"]
+
+    def test_l1_v5_fields_default_empty(self):
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="p", traits=["a"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+        )
+        assert l1.visual_anchors == []
+        assert l1.tracked_object_names == []
+
+    def test_character_state_status_and_reliability(self):
+        cs = CharacterState(name="沈父", status="fading", reliability=0.4)
+        assert cs.status == "fading"
+        assert cs.reliability == 0.4
+
+    def test_character_state_reliability_bounds(self):
+        with pytest.raises(ValueError):
+            CharacterState(name="X", reliability=-0.1)
+        with pytest.raises(ValueError):
+            CharacterState(name="X", reliability=1.5)
+
+    def test_character_state_defaults_active(self):
+        cs = CharacterState(name="X")
+        assert cs.status == "active"
+        assert cs.reliability == 1.0
+
+    def test_scene_outline_time_marker(self):
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c",
+                          time_marker="第一声鸡鸣")
+        assert so.time_marker == "第一声鸡鸣"
+
+    def test_world_bible_v5_fields(self):
+        wb = WorldBible(
+            visual_anchors=["A", "B"],
+            tracked_objects=[TrackedObject(name="三碗酒", current_state="初始")],
+            fulfilled_anchors=["A"],
+            time_markers_used=["鸡鸣前", "第一声鸡鸣"],
+        )
+        assert wb.visual_anchors == ["A", "B"]
+        assert len(wb.tracked_objects) == 1
+        assert wb.fulfilled_anchors == ["A"]
+        assert wb.time_markers_used == ["鸡鸣前", "第一声鸡鸣"]
+
+    def test_bible_update_v5_increments(self):
+        bu = BibleUpdate(
+            chapter_index=3,
+            object_state_changes=[TrackedObject(name="三碗酒", current_state="左碗裂")],
+            character_status_changes=[CharacterState(name="沈父", status="gone")],
+            visual_anchors_fulfilled=["父亲化作泥塑裂纹"],
+        )
+        assert bu.object_state_changes[0].current_state == "左碗裂"
+        assert bu.character_status_changes[0].status == "gone"
+        assert bu.visual_anchors_fulfilled == ["父亲化作泥塑裂纹"]
+
+    def test_final_verdict_unfulfilled_anchors_default_empty(self):
+        fv = FinalVerdict(usable=True, overall_score=0.9)
+        assert fv.unfulfilled_anchors == []
+
+    def test_final_verdict_unfulfilled_anchors_set(self):
+        fv = FinalVerdict(usable=False, overall_score=0.4,
+                          unfulfilled_anchors=["锚点 X 未兑现"])
+        assert fv.unfulfilled_anchors == ["锚点 X 未兑现"]
+
+    def test_novel_state_v5_roundtrip(self):
+        import json
+        ui = UserInput(premise="long enough premise text for length check",
+                       pipeline_version="v5")
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="p", traits=["a"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+            visual_anchors=["泥塑裂纹"],
+            tracked_object_names=["三碗酒"],
+        )
+        wb = WorldBible(visual_anchors=["A"], tracked_objects=[
+            TrackedObject(name="X", current_state="s")])
+        fv = FinalVerdict(usable=False, overall_score=0.3, unfulfilled_anchors=["B"])
+        ns = NovelState(user_input=ui, l1=l1, world_bible=wb, final_verdict=fv)
+        ns2 = NovelState.model_validate_json(json.dumps(json.loads(ns.model_dump_json())))
+        assert ns2.l1.visual_anchors == ["泥塑裂纹"]
+        assert ns2.world_bible.tracked_objects[0].name == "X"
+        assert ns2.final_verdict.unfulfilled_anchors == ["B"]

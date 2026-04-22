@@ -25,7 +25,9 @@ class UserInput(BaseModel):
     #   v2 = V2 增强（L3 → final_audit → L4_adversarial → L4_scrubber → finalize）
     #   v3 = V3 长篇（interleaved L2_i → L3_i → bible_update_i，世界观知识库维护跨章一致性）
     #   v4 = V4 场景分解（L2_i → L2.5_i 场景列表 → L3_{i,s} 逐场景写作 + continuity 审头）
-    pipeline_version: Literal["v1", "v2", "v3", "v4"] = "v1"
+    #   v5 = V5 premise 忠实度（+ visual_anchors / time_markers / tracked_objects /
+    #                          character status · 四个 state-tracking 维度）
+    pipeline_version: Literal["v1", "v2", "v3", "v4", "v5"] = "v1"
     # V4: L2.5 场景分解层的软目标——每章 3-5 场景，LLM 在此范围内自由决定
     scenes_per_chapter_hint: int = Field(4, ge=2, le=8)
 
@@ -55,6 +57,9 @@ class L1Skeleton(BaseModel):
     three_act: ThreeAct
     world_rules: list[str]
     revision: int = 0
+    # V5: premise 忠实度硬约束
+    visual_anchors: list[str] = Field(default_factory=list)      # 3-5 条必保视觉/超自然呈现画面
+    tracked_object_names: list[str] = Field(default_factory=list) # 2-5 个跨章追踪的关键物件名
 
 
 class L2ChapterOutline(BaseModel):
@@ -119,6 +124,9 @@ class CharacterState(BaseModel):
     arc_state: str = ""                                        # 当前弧光阶段（"怀疑期"/"觉醒期"）
     last_appeared_in: int = 0                                  # 最后出场章节（0=未出场）
     notable_events: list[str] = Field(default_factory=list)    # 已发生的关键事件
+    # V5: 存续状态 · 影响笔法（gone 角色不得直接现身）
+    status: Literal["active", "fading", "gone"] = "active"
+    reliability: float = Field(1.0, ge=0.0, le=1.0)            # 记忆可信度（0=完全遗忘）
 
 
 class WorldFact(BaseModel):
@@ -126,6 +134,18 @@ class WorldFact(BaseModel):
     category: Literal["rule", "location", "item", "relationship", "event"]
     content: str                                               # ≤60 字
     ch_introduced: int                                         # 引入章节
+
+
+class TrackedObject(BaseModel):
+    """V5 被追踪的关键物件 · 跨章节状态机。
+
+    与 WorldFact(category='item') 的区别：WorldFact 只记"物件存在"，TrackedObject 记"物件当前状态"，
+    L3 写作时必须与 current_state 一致，continuity 审头读这个对照。
+    """
+    name: str                                                  # 「三碗酒」「半块木牌」「斗笠」
+    current_state: str                                         # 「初始满碗」/「左碗裂中」/「三碗皆空」
+    last_changed_ch: int = 0                                   # 最后被 bible_update 修改的章节
+    state_history: list[str] = Field(default_factory=list)     # ["ch1: 满", "ch4: 左裂"]
 
 
 class WorldBible(BaseModel):
@@ -141,6 +161,11 @@ class WorldBible(BaseModel):
     active_foreshadow: list[str] = Field(default_factory=list)   # 已埋未兑现的伏笔
     paid_foreshadow: list[str] = Field(default_factory=list)     # 已兑现的伏笔
     last_updated_ch: int = 0                                     # 最后一次 bible_update 覆盖到的章节
+    # V5: premise 忠实度专用字段
+    visual_anchors: list[str] = Field(default_factory=list)      # 从 L1.visual_anchors copy；不可再动
+    tracked_objects: list[TrackedObject] = Field(default_factory=list)
+    fulfilled_anchors: list[str] = Field(default_factory=list)   # 各章 bible_update 报告已兑现的
+    time_markers_used: list[str] = Field(default_factory=list)   # 全书按章 append 的 time_marker 序列
 
 
 class BibleUpdate(BaseModel):
@@ -153,6 +178,10 @@ class BibleUpdate(BaseModel):
     new_foreshadow: list[str] = Field(default_factory=list)      # 本章新埋的
     paid_foreshadow: list[str] = Field(default_factory=list)     # 本章兑现的（要从 active 移除）
     consistency_issues: list[str] = Field(default_factory=list)  # 与 bible 矛盾的地方（写给下次 L3 retry 的）
+    # V5: premise 忠实度增量
+    object_state_changes: list[TrackedObject] = Field(default_factory=list)       # 本章物件状态变化
+    character_status_changes: list[CharacterState] = Field(default_factory=list)  # 本章角色存续变更
+    visual_anchors_fulfilled: list[str] = Field(default_factory=list)             # 本章实现的 anchor（字面对齐 bible.visual_anchors）
 
 
 # ============ V4: 场景分解层（L2.5） ============
@@ -165,6 +194,8 @@ class SceneOutline(BaseModel):
     dominant_motifs: list[str] = Field(default_factory=list)    # 核心意象/物件
     pov: str = ""                                               # 视角
     approximate_words: int = Field(300, ge=100, le=1500)        # 目标字数
+    # V5: 全局时间轴锚点（跨章单调递进，L2.5 分配，L3 严格遵守）
+    time_marker: str = ""                                       # 如"鸡鸣前"/"第一声鸡鸣"/"天光微白"
 
 
 class ChapterSceneList(BaseModel):
@@ -206,6 +237,8 @@ class FinalVerdict(BaseModel):
     retry_hint: str = ""                                     # 打回时给该层的定向反馈
     # 机械检查附加
     slop_avg: float = 0.0                                    # 各章 slop 平均分
+    # V5: premise 视觉锚点未兑现清单（非空 → engine 强制 bounce 不尊重 usable=True）
+    unfulfilled_anchors: list[str] = Field(default_factory=list)
 
 
 class NovelState(BaseModel):
