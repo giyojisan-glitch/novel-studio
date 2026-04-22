@@ -53,6 +53,9 @@ def export_artifacts(state: NovelState, pdir: Path) -> Path:
     # V5: premise 视觉锚点兑现追踪（独立 artifact 便于人眼审核）
     if state.world_bible and state.world_bible.visual_anchors:
         (adir / "09_visual_anchors.md").write_text(_render_visual_anchors(state), encoding="utf-8")
+    # V6: 叙事承诺账本（setup_ch / payoff_ch / fulfilled）
+    if state.world_bible and state.world_bible.plot_promises:
+        (adir / "10_plot_promises.md").write_text(_render_plot_promises(state), encoding="utf-8")
     return adir
 
 
@@ -80,6 +83,40 @@ def _render_visual_anchors(state: NovelState) -> str:
     return "\n".join(L)
 
 
+def _render_plot_promises(state: NovelState) -> str:
+    """V6 叙事承诺账本 · 每条 promise 的 setup_ch / payoff_ch / fulfilled 追踪。"""
+    wb = state.world_bible
+    L = ["# Plot Promises · Premise 叙事承诺追踪（V6）\n"]
+    L.append("> L1 从 premise 抽取的情节机巧（非视觉）。每条必须在某章**具体引爆**才算 fulfilled。\n")
+    L.append("> 与 09_visual_anchors 区别：")
+    L.append("> - 09 兜「视觉画面」（如「泥塑裂纹」）")
+    L.append("> - 10 兜「叙事承诺」（如「埋下跨越十年的死子」）\n")
+    L.append("---\n")
+    for p in wb.plot_promises:
+        if p.fulfilled:
+            head = f"## ✅ {p.id} · {p.content}"
+            meta = f"**setup @ ch{p.setup_ch}** → **payoff @ ch{p.payoff_ch}**"
+        elif p.setup_ch > 0:
+            head = f"## ⏳ {p.id} · {p.content}"
+            meta = f"**setup @ ch{p.setup_ch}**（已埋） → payoff @ ch{p.payoff_ch or '?'}（未引爆）"
+        else:
+            head = f"## ⏸ {p.id} · {p.content}"
+            meta = "**未埋**（setup_ch=0）"
+        L.append(head)
+        L.append(f"- {meta}")
+        L.append("")
+    unfulfilled = [p for p in wb.plot_promises if not p.fulfilled]
+    if unfulfilled:
+        L.append("---\n")
+        L.append(f"## ⚠️ 未兑现（{len(unfulfilled)}/{len(wb.plot_promises)}）")
+        L.append("若 final_audit 跑完后本清单非空，engine 会强制 bounce 回 L3 重写。")
+    else:
+        L.append("---\n")
+        L.append("## ✅ 全部兑现")
+    L.append("")
+    return "\n".join(L)
+
+
 def _render_scene_lists(state: NovelState) -> str:
     """V4 L2.5 产出：每章的场景设计列表（不含 L3 实际 prose）。"""
     L = ["# Scene Lists（V4 L2.5 章节场景分解）\n"]
@@ -98,6 +135,10 @@ def _render_scene_lists(state: NovelState) -> str:
                 L.append(f"- **视角**：{sc.pov}")
             if sc.time_marker:
                 L.append(f"- **⏳ time_marker**（V5）：`{sc.time_marker}`")
+            if getattr(sc, "technical_setup", ""):
+                L.append(f"- **🔧 technical_setup**（V6）：{sc.technical_setup}")
+            if getattr(sc, "technical_payoff", ""):
+                L.append(f"- **🔧 technical_payoff**（V6）：{sc.technical_payoff}")
             L.append("")
         if csl.transition_notes:
             L.append("### 转场注记")
@@ -150,6 +191,8 @@ def _render_world_bible(state: NovelState) -> str:
         L.append(f"### {c.name}")
         if c.traits:
             L.append(f"- 特质：{'、'.join(c.traits)}")
+        if getattr(c, "faction", ""):
+            L.append(f"- 🏴 阵营（V6）：{c.faction}")
         if c.arc_state:
             L.append(f"- 弧光阶段：{c.arc_state}")
         if c.last_appeared_in:
@@ -225,6 +268,19 @@ def _render_world_bible(state: NovelState) -> str:
     if b.time_markers_used:
         L.append("## V5 · 全书 Time Markers（按章按场景顺序）")
         L.append(" → ".join(f"「{m}」" for m in b.time_markers_used))
+        L.append("")
+
+    # V6: plot_promises 账本
+    if b.plot_promises:
+        L.append("## V6 · Plot Promises（叙事承诺账本）")
+        for p in b.plot_promises:
+            if p.fulfilled:
+                marker = f"✅ setup@ch{p.setup_ch} → payoff@ch{p.payoff_ch}"
+            elif p.setup_ch > 0:
+                marker = f"⏳ setup@ch{p.setup_ch}（已埋，未引爆）"
+            else:
+                marker = "⏸ 未埋"
+            L.append(f"- **{p.id}** · {p.content}  [{marker}]")
         L.append("")
 
     return "\n".join(L)

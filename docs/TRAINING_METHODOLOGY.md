@@ -5,7 +5,7 @@
 
 ---
 
-## 1. 核心思路（六层创新）
+## 1. 核心思路（七层创新）
 
 对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在六个维度：
 
@@ -247,7 +247,85 @@ class FinalVerdict:
 
 **增加的 LLM 调用**：**零**。V5 不加任何新 step，只在现有 prompt 里加注入块 + 扩充 schema 字段。
 
-**当前状态**（2026-04-22）：V5 五个 commit 已落地。Schema + engine + prompts + artifacts + CLI + 208 tests 全绿。外部审稿 Agent 标定的 4 条病灶都在架构层面有对应机制。真 LLM 5 章验证是下一步（对比 V4 demo `San_Wan_Jiu_20260422-002914.md`）。
+**当前状态**（2026-04-22）：V5 五个 commit 已落地。Schema + engine + prompts + artifacts + CLI + 208 tests 全绿。外部审稿 Agent 标定的 4 条病灶都在架构层面有对应机制。真 LLM 5 章 Doubao demo 完成：4/4 visual_anchors 兑现，时间轴单调递进不重启，tracked_objects 5 章 state_history 完整，final_verdict 0.92 无 bounce。
+
+### 1.7 V6 叙事承诺 + 阵营图谱 + 技术性伏笔
+
+**V5 真 LLM 5 章 Doubao demo（2026-04-22《裂棋》）跑完后，第二轮外部审稿找到三类 V5 盲区**：
+
+| 外部 Agent 发现的 V5 盲区 | 核验结果 | 根因 |
+|---|---|---|
+| **叙事承诺被漏抽** | ✅ 属实（"死子"premise 明确强调，7097 字正文 0 次出现） | `visual_anchors` 只兜视觉画面，不兜情节机巧 |
+| **多派系角色身份混淆** | ✅ 属实（灰衣顾府 vs 玄色沈家都叫"暗桩"，读者要靠服色推） | `CharacterState` 无 `faction` 字段，continuity 头无对应校验 |
+| **题材专业术语失真** | ✅ 完全属实（围棋术语 0 次，"真气" 19 次占位） | `SceneOutline` 无 technical_setup/payoff 槽，L3 回落到 genre 通用模糊动作词 |
+
+**V6 做法**：三条正交 schema 增补，不动 V5 任何机制。
+
+```python
+# L1 扩展
+class L1Skeleton:
+    plot_promises: list[PlotPromise]   # 3-5 条叙事承诺（非视觉的情节机巧）
+
+class CharacterCard:
+    faction: str = ""                  # 阵营（主角/反派都要标）
+
+# 新类
+class PlotPromise:
+    id: str                            # fs_1 / fs_2 稳定引用
+    content: str                       # ≤50 字，如「埋下跨越十年的死子」
+    setup_ch: int = 0                  # 埋设章节（0=未埋）
+    payoff_ch: int = 0                 # 兑现章节（0=未兑现）
+    fulfilled: bool = False            # 真正兑现标记（bible_update 报告）
+
+# L2ChapterOutline 扩展
+class L2ChapterOutline:
+    promise_setups: list[str]          # 本章要 setup 的 promise.id
+    promise_payoffs: list[str]         # 本章要 payoff 的 promise.id
+
+# SceneOutline 扩展
+class SceneOutline:
+    technical_setup: str               # 体裁术语写的具体铺垫（"白72手留下死子"）
+    technical_payoff: str              # 体裁术语写的具体引爆
+
+# CharacterState 扩展
+class CharacterState:
+    faction: str                       # 阵营字段（覆盖 V5 新增之外）
+
+# WorldBible 扩展
+class WorldBible:
+    plot_promises: list[PlotPromise]   # 从 L1 copy，各 bible_update 更新 setup_ch/payoff_ch/fulfilled
+
+# BibleUpdate 扩展
+class BibleUpdate:
+    promise_setups_done: list[str]
+    promise_payoffs_done: list[str]
+
+# FinalVerdict 扩展
+class FinalVerdict:
+    unfulfilled_promises: list[str]    # 非空 → engine 强制 bounce（镜像 V5 unfulfilled_anchors）
+```
+
+**4 条强制链路**：
+
+1. **Plot promises 跨章追踪**：L1 从 premise 抽承诺（prompt 禁收"复仇/击败反派"这种结局描述，要求收"埋三颗跨越十年的死子"这种可操作的情节机巧）→ bible_init 原样 copy → L2 必须分配 setup_ch/payoff_ch → L3 scene prompt 注入本章分配 → bible_update 报告实际 done → final_audit 检查未兑现的 → engine 兜底强制 bounce
+
+2. **阵营一致性**：L1 要求主角/反派带 faction → bible_init propagate → L3 scene prompt 注入"阵营图谱"块（暗桩/内线必须通过服色+阵营显式区分）→ continuity 审头新增"同名不改阵营"校验
+
+3. **体裁专业术语硬约束**：L2.5 要求每个 scene.technical_setup/payoff 用体裁术语写具体铺垫 → L3 scene prompt 注入本场 technical_setup/payoff 并禁用"真气/金光/喷血"等武侠万能模糊词 → continuity 审头新增"technical specificity"校验
+
+4. **engine 双重保险**：final_audit prompt 要求 LLM 填 `unfulfilled_promises` + apply_responses(final_audit) 检测非空强制 usable=False + suspect=L3（不信 LLM 自报）
+
+**关键设计决策**：
+
+1. **PlotPromise 是 class 不是 string**：visual_anchors 是 list[str] 因为它只需"兑现/未兑现"二元状态；PlotPromise 需要 setup_ch/payoff_ch 两个章节指针 + fulfilled 布尔 → 必须是 class 才能承载生命周期
+2. **faction 字段自由文本不枚举**：不同 genre 的阵营结构不同（武侠=门派/朝廷/江湖；悬疑=警方/嫌疑人/媒体；科幻=联邦/起义军），让 LLM 按 premise 自由定义
+3. **V6 继承 V5 全部机制**：`_v5_active(state)` 现在对 v5/v6 都返回 True，V5 所有注入块在 V6 下继续工作，V6 只是再追加自己的块
+4. **零额外 LLM 调用**：V6 不加任何新 step（visual_anchors 已经设下 pattern——所有 premise 级约束由 L1 一次抽），只在现有 prompt 里加注入块 + 扩充 schema 字段
+5. **unknown promise.id 被忽略**：apply_bible_update 收到 `promise_setups_done=["fs_编造的"]` 时不会把它追加到 bible——防 LLM 编造新 id 绕过约束
+
+**增加的 LLM 调用**：**零**。
+
+**当前状态**（2026-04-22）：V6 四个 commit 已落地。Schema + engine + prompts + artifacts + CLI + README + docs + 241 tests 全绿。第二轮外部审稿 Agent 标定的 3 条 V5 盲区都在架构层面有对应机制。真 LLM 5 章 Doubao 验证是下一步（同 premise `棋圣赛复仇`，对比 V5 demo `裂棋`）。
 
 ---
 

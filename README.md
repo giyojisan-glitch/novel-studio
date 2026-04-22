@@ -90,10 +90,11 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 - ✅ **Lora-style Inspiration RAG**: `inspirations/{author}/*.txt` → BAAI/bge-large-zh-v1.5 embeddings → Chroma → auto-injected into L3 prompts as style references. See [`docs/TRAINING_METHODOLOGY.md`](docs/TRAINING_METHODOLOGY.md) for A/B validation results.
 - ✅ **V3 long-form pipeline** (`--pipeline v3`): interleaved L2/L3 (each chapter outline sees the real prose of prior chapters) + **WorldBible** (per-chapter `bible_update` extracts new characters, facts, timeline events, and foreshadow state; bible is injected as context into subsequent L2/L3 prompts). Supports up to 30 chapters.
 - ✅ **V4 scene decomposition + multi-scale continuity** (`--pipeline v4`): adds an L2.5 layer that breaks each chapter into 3-5 scenes with explicit opening/closing beats. L3 writes scene-by-scene; each scene prompt sees a CNN-style **multi-scale context** (last 400 chars of prev scene at high resolution, prior scene beats at mid resolution, last 3 chapters' closing at low resolution) + an **anti-cold-open hard constraint** that forbids chapter-restart templates ("指节攥得发白"). New **continuity audit head** (alongside logic + pace) scores cross-scene/cross-chapter handoff. L2 prompts now actually see the 800-char tail of the previous chapter's last scene (V3's half-kept interleaved promise finally fulfilled).
-- ✅ **V5 premise fidelity** (`--pipeline v5`): four state-tracking mechanisms address the drift bugs surfaced by an external review of V4's first novel (missing visual anchors, repeated cockcrow timeline, partial object states, missing character-obsolescence mechanic). L1 extracts **`visual_anchors`** from premise (concrete must-keep images like 「父亲化作泥塑裂纹」); L2.5 assigns a **`time_marker`** per scene with monotonic progression enforced across chapters; **`tracked_objects`** maintain current state cross-chapter and L3 must not contradict; **character `status`** (active/fading/gone) + `reliability` drive writing-style shifts for disappearing characters. Continuity audit reads bible state as ground truth. `final_audit` explicitly checks anchor fulfillment and engine force-bounces if `unfulfilled_anchors` non-empty. **Recommended for long-form**.
+- ✅ **V5 premise fidelity** (`--pipeline v5`): four state-tracking mechanisms address the drift bugs surfaced by an external review of V4's first novel (missing visual anchors, repeated cockcrow timeline, partial object states, missing character-obsolescence mechanic). L1 extracts **`visual_anchors`** from premise (concrete must-keep images like 「父亲化作泥塑裂纹」); L2.5 assigns a **`time_marker`** per scene with monotonic progression enforced across chapters; **`tracked_objects`** maintain current state cross-chapter and L3 must not contradict; **character `status`** (active/fading/gone) + `reliability` drive writing-style shifts for disappearing characters. Continuity audit reads bible state as ground truth. `final_audit` explicitly checks anchor fulfillment and engine force-bounces if `unfulfilled_anchors` non-empty.
+- ✅ **V6 叙事承诺 + 阵营图谱** (`--pipeline v6`): three orthogonal schema additions plug V5's blind spots surfaced by the second external review of V5's first novel (missing specialized plot mechanics like "死子", faction-ambiguous 暗桩/内线, technical depth replaced by 真气/喷血 武侠 tropes). L1 extracts **`plot_promises`** (non-visual narrative contracts: "埋下跨越十年的死子" / "揭露构陷证据"—things visual_anchors can't catch because they're *plot mechanics*, not *pictures*); L2 assigns setup/payoff chapters; L2.5 scene gets **`technical_setup / technical_payoff`** fields forcing genre-specific terminology (围棋的死活/手筋, 悬疑的物证链). **CharacterState.faction** disambiguates multi-faction characters (顾府 vs 沈家 暗桩). Continuity audit adds 3 V6 checks (promise fulfillment, faction consistency, technical specificity). Final audit + engine force-bounces on `unfulfilled_promises`. **Recommended for long-form**.
 - ✅ Artifacts export (every layer's output is human-readable)
 - ✅ CLI with init/step/status/artifacts/inspire commands
-- ✅ 208 unit tests green
+- ✅ 241 unit tests green
 
 ### A/B validated signals (see `docs/TRAINING_METHODOLOGY.md`)
 
@@ -104,8 +105,8 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 ### What's missing (and why it's hard)
 
 1. **3 audit heads (logic + pace + continuity).** Still missing character-consistency and style heads that the original design called for.
-2. **V5 not yet battle-tested on real LLM.** V4 5-chapter demo ran to completion; V5 adds targeted anti-drift mechanisms but the combined impact on 10-chapter output is unverified.
-3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3/V4/V5 work.
+2. **V6 not yet battle-tested on real LLM.** V5 5-chapter Doubao demo ran cleanly (all visual_anchors fulfilled, monotonic time markers). V6 addresses the narrative-contract / faction / technical-specificity blind spots surfaced by the subsequent external review, but the combined effect on shipping output is unverified until a fresh 5-chapter Doubao run completes.
+3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3/V4/V5/V6 work.
 4. **Chinese-first.** Prompts and style packs are in Mandarin. Architecture is language-agnostic; porting is a translation task.
 5. **UX rough edges**: `step` doesn't remember the `--provider` chosen at `init`, must be passed each call.
 
@@ -205,12 +206,17 @@ uv run novel-studio init --file inputs/my_novel.md \
     --genre 志怪 --chapters 10 --words 1500 \
     --provider doubao --pipeline v4 --scenes-per-chapter 4
 
-# V5 recommended for shippable long-form (V4 + premise fidelity
-# mechanisms: visual_anchors, time_markers, tracked_objects, 
+# V5 premise fidelity (visual_anchors, time_markers, tracked_objects, 
 # character status tracking).
 uv run novel-studio init --file inputs/my_novel.md \
     --genre 志怪 --chapters 10 --words 1500 \
     --provider doubao --pipeline v5 --scenes-per-chapter 4
+
+# V6 recommended for shippable long-form (V5 + narrative contracts
+# + faction map + technical setup/payoff).
+uv run novel-studio init --file inputs/my_novel.md \
+    --genre 武侠 --chapters 10 --words 1500 \
+    --provider doubao --pipeline v6 --scenes-per-chapter 4
 
 # Advance (for auto providers one call per stage):
 uv run novel-studio step projects/{timestamp}/ --provider doubao
@@ -317,6 +323,51 @@ final_audit                      + 强制检查 unfulfilled_anchors
 
 New artifact:
 - `artifacts/{slug}/09_visual_anchors.md` — each anchor's ✅/⏳ status. If anything's ⏳ when final_audit runs, engine bounces.
+
+### V6 叙事承诺 + 阵营图谱 + 技术性伏笔
+
+After V5's first Doubao production run (5 chapters, all visual_anchors fulfilled, monotonic time markers), a second external review found three structural gaps that V5's visual-only anchoring couldn't catch:
+
+1. **Narrative-contract blind spot**: premise said "埋下数颗跨越十年的死子" (literally "lay down dead stones spanning ten years" — the central plot mechanic of the go-chess premise). The novel used the word "死子" exactly zero times in 7097 characters. `visual_anchors` only extracts *pictures*, not *plot promises* — so this contract had no schema slot to bind to.
+2. **Faction ambiguity**: the story had two opposed factions (顾府 / 沈家) both employing "暗桩" (secret agents). Readers had to infer allegiance from clothing color alone; CharacterState had no `faction` field to enforce consistency.
+3. **Specialized-vocab bleed**: specifically because `--genre 武侠` was chosen, L3 fell back on generic wuxia tropes ("真气 19 次", 喷血-style climaxes) instead of the go-specific mechanics the premise demanded ("劫/死活/手筋/官子" — all zero occurrences). SceneOutline had no technical-specificity slot.
+
+V6 adds three orthogonal schema additions:
+
+```
+L1 骨架                  + plot_promises: list[PlotPromise]   ← 非视觉的叙事承诺
+                         + CharacterCard.faction              ← 主角/反派阵营
+ └── bible_init           copies plot_promises, propagates faction → CharacterState
+
+L2_i outline             + promise_setups: list[str]          ← 本章要埋设的 promise.id
+                         + promise_payoffs: list[str]         ← 本章要引爆的 promise.id
+
+L2.5_i scene list        each SceneOutline gets:
+                         + technical_setup: str               ← 体裁术语写的具体铺垫
+                         + technical_payoff: str              ← 体裁术语写的具体引爆
+
+L3_{i,s} prose           + 叙事承诺账本 block
+                         + 本章 promise 分配 block
+                         + 角色阵营图谱 block（暗桩/内线必须用服色+阵营显式区分）
+                         + 本场 technical_setup/payoff block
+
+continuity_audit         + 3 项 V6 检查:
+                           · promise 兑现（具体术语 vs 模糊"真气喷血"）
+                           · 角色阵营一致（同名不改阵营）
+                           · technical specificity（禁用万能模糊词替代专业术语）
+
+bible_update_i           + promise_setups_done / promise_payoffs_done（匹配 bible.id）
+
+final_audit              + 强制检查 unfulfilled_promises
+  engine force-bounces if non-empty（镜像 V5 unfulfilled_anchors 机制）
+```
+
+**Why plot_promises ≠ visual_anchors**: Premise 里同时存在"画面必保项"（visual）和"情节必守约"（plot promise）。"父亲化作泥塑上的裂纹"是视觉——能被 visual_anchors 捕获，也能通过看正文识别兑现。"埋下跨越十年的死子"是专业机巧——是"在章节 X 做 A 动作以便章节 Y 的 B 动作能 payoff"这种 *跨章节的叙事合约*，visual_anchors 逻辑上无法承载。V6 用 PlotPromise.setup_ch/payoff_ch 的显式 ledger 兜住这类承诺。
+
+**Why faction ≠ character traits**: V5 的 `CharacterState.traits` 存的是稳定特质（"左眉旧疤"/"棋艺高超"），不含"立场"。当 premise 涉及多股势力，同一个泛称（"暗桩"/"内线"）会被不同阵营同时使用。没有 `faction` 字段时，LLM 只能靠服色/物件/场景间接传达，读者要推；有了 `faction` 字段，continuity 审头可以直接做"同名不改阵营"校验。
+
+New artifact:
+- `artifacts/{slug}/10_plot_promises.md` — each promise's ⏸/⏳/✅ status（未埋/已埋未引爆/已引爆）+ setup_ch / payoff_ch 章节追踪。镜像 09_visual_anchors 的人眼审阅范式。
 
 ### Seed the inspiration library (Lora-style style transfer)
 
