@@ -24,6 +24,7 @@ from novel_studio.state import (
     CharacterState,
     WorldBible,
     BibleUpdate,
+    PlotPromise,
 )
 
 
@@ -77,6 +78,10 @@ class TestUserInput:
     def test_v5_pipeline_opt_in(self):
         ui = UserInput(premise="test", pipeline_version="v5")
         assert ui.pipeline_version == "v5"
+
+    def test_v6_pipeline_opt_in(self):
+        ui = UserInput(premise="test", pipeline_version="v6")
+        assert ui.pipeline_version == "v6"
 
 
 # ---------- V4: SceneOutline / ChapterSceneList / L3SceneDraft / SceneCard ----------
@@ -427,3 +432,109 @@ class TestV5Schema:
         assert ns2.l1.visual_anchors == ["泥塑裂纹"]
         assert ns2.world_bible.tracked_objects[0].name == "X"
         assert ns2.final_verdict.unfulfilled_anchors == ["B"]
+
+
+class TestV6Schema:
+    """V6: PlotPromise + faction + technical_setup/payoff + unfulfilled_promises."""
+
+    def test_plot_promise_basic(self):
+        p = PlotPromise(id="fs_1", content="埋下三颗跨越十年的死子")
+        assert p.id == "fs_1"
+        assert p.setup_ch == 0 and p.payoff_ch == 0
+        assert p.fulfilled is False
+
+    def test_plot_promise_lifecycle(self):
+        p = PlotPromise(id="fs_1", content="X", setup_ch=1, payoff_ch=5, fulfilled=True)
+        assert p.setup_ch == 1 and p.payoff_ch == 5
+        assert p.fulfilled is True
+
+    def test_l1_plot_promises_optional(self):
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="p", traits=["a"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+            plot_promises=[PlotPromise(id="fs_1", content="死子伏笔")],
+        )
+        assert l1.plot_promises[0].content == "死子伏笔"
+
+    def test_l1_plot_promises_default_empty(self):
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="p", traits=["a"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+        )
+        assert l1.plot_promises == []
+
+    def test_character_state_faction(self):
+        cs = CharacterState(name="灰衣暗桩", faction="顾府")
+        assert cs.faction == "顾府"
+
+    def test_character_state_faction_default_empty(self):
+        cs = CharacterState(name="X")
+        assert cs.faction == ""
+
+    def test_scene_outline_technical_setup_payoff(self):
+        so = SceneOutline(
+            index=1, purpose="决赛序盘", opening_beat="o", closing_beat="c",
+            technical_setup="白72手留下看似失误的死子",
+            technical_payoff="",
+        )
+        assert so.technical_setup == "白72手留下看似失误的死子"
+        assert so.technical_payoff == ""
+
+    def test_scene_outline_technical_defaults_empty(self):
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c")
+        assert so.technical_setup == ""
+        assert so.technical_payoff == ""
+
+    def test_l2_promise_assignment(self):
+        l2 = L2ChapterOutline(
+            index=1, title="t", summary="s", hook="h", pov="第三人称",
+            key_events=["e"], prev_connection="c",
+            promise_setups=["fs_1"], promise_payoffs=[],
+        )
+        assert l2.promise_setups == ["fs_1"]
+
+    def test_world_bible_plot_promises(self):
+        wb = WorldBible(plot_promises=[PlotPromise(id="fs_1", content="X")])
+        assert wb.plot_promises[0].id == "fs_1"
+
+    def test_bible_update_v6_increments(self):
+        bu = BibleUpdate(
+            chapter_index=5,
+            promise_setups_done=["fs_1"],
+            promise_payoffs_done=["fs_2", "fs_3"],
+        )
+        assert bu.promise_setups_done == ["fs_1"]
+        assert bu.promise_payoffs_done == ["fs_2", "fs_3"]
+
+    def test_final_verdict_unfulfilled_promises(self):
+        fv = FinalVerdict(usable=False, overall_score=0.4,
+                          unfulfilled_promises=["fs_3 死子未引爆"])
+        assert fv.unfulfilled_promises == ["fs_3 死子未引爆"]
+
+    def test_novel_state_v6_roundtrip(self):
+        import json
+        ui = UserInput(premise="long enough premise text 用于长度校验",
+                       pipeline_version="v6")
+        l1 = L1Skeleton(
+            title="t", logline="l", theme="T",
+            protagonist=CharacterCard(name="p", traits=["a"], want="w", need="n"),
+            three_act=ThreeAct(setup="s", confrontation="c", resolution="r"),
+            world_rules=["r1"],
+            plot_promises=[PlotPromise(id="fs_1", content="埋死子")],
+        )
+        wb = WorldBible(plot_promises=[PlotPromise(id="fs_1", content="埋死子",
+                                                    setup_ch=1, payoff_ch=5, fulfilled=True)])
+        cs = CharacterState(name="顾衍之", faction="顾府")
+        wb.characters.append(cs)
+        fv = FinalVerdict(usable=False, overall_score=0.3,
+                          unfulfilled_promises=["fs_2"])
+        ns = NovelState(user_input=ui, l1=l1, world_bible=wb, final_verdict=fv)
+        ns2 = NovelState.model_validate_json(json.dumps(json.loads(ns.model_dump_json())))
+        assert ns2.l1.plot_promises[0].id == "fs_1"
+        assert ns2.world_bible.plot_promises[0].fulfilled is True
+        assert ns2.world_bible.characters[0].faction == "顾府"
+        assert ns2.final_verdict.unfulfilled_promises == ["fs_2"]

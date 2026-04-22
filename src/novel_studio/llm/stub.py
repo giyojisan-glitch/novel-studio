@@ -36,6 +36,11 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         # V5 字段
         "visual_anchors": ["测试视觉锚点 A", "测试视觉锚点 B"],
         "tracked_object_names": ["测试物件 1", "测试物件 2"],
+        # V6 字段：叙事承诺
+        "plot_promises": [
+            {"id": "fs_1", "content": "测试叙事承诺 A", "setup_ch": 0, "payoff_ch": 0, "fulfilled": False},
+            {"id": "fs_2", "content": "测试叙事承诺 B", "setup_ch": 0, "payoff_ch": 0, "fulfilled": False},
+        ],
     },
     "_L2_TEMPLATE": {
         "title": "测试章节",
@@ -47,6 +52,9 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         "revision": 0,
         "foreshadow_planted": [],
         "foreshadow_paid": [],
+        # V6 字段
+        "promise_setups": [],
+        "promise_payoffs": [],
     },
     "_L25_SCENE_TEMPLATE": {
         # 每个 SceneOutline 的默认结构（L25 的 scenes 列表里用）
@@ -54,6 +62,8 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         "closing_beat": "落点", "dominant_motifs": ["物件A"],
         "pov": "第三人称限知", "approximate_words": 300,
         "time_marker": "测试时间 1",  # V5 字段
+        "technical_setup": "",        # V6 字段
+        "technical_payoff": "",
     },
     "_L3_TEMPLATE": {
         "content": "测试正文。" * 50,
@@ -82,6 +92,7 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         "retry_hint": "",
         "slop_avg": 1.0,
         "unfulfilled_anchors": [],   # V5
+        "unfulfilled_promises": [],  # V6
     },
     "_L4_ADVERSARIAL_TEMPLATE": [
         {"category": "FAT", "quoted_text": "可有可无的句子", "reason": "stub"},
@@ -118,6 +129,9 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
         "object_state_changes": [],
         "character_status_changes": [],
         "visual_anchors_fulfilled": [],
+        # V6 字段
+        "promise_setups_done": [],
+        "promise_payoffs_done": [],
     },
     "_L25_TEMPLATE": {
         # chapter_index 由 _template_for 注入
@@ -125,15 +139,18 @@ _STUB_TEMPLATES: dict[str, dict[str, Any]] = {
             {"index": 1, "purpose": "建立场景", "opening_beat": "开场动作 1",
              "closing_beat": "落点 1", "dominant_motifs": ["物件A"],
              "pov": "第三人称限知", "approximate_words": 300,
-             "time_marker": "锚点 1"},
+             "time_marker": "锚点 1",
+             "technical_setup": "", "technical_payoff": ""},
             {"index": 2, "purpose": "冲突推进", "opening_beat": "开场动作 2",
              "closing_beat": "落点 2", "dominant_motifs": ["物件B"],
              "pov": "第三人称限知", "approximate_words": 300,
-             "time_marker": "锚点 2"},
+             "time_marker": "锚点 2",
+             "technical_setup": "", "technical_payoff": ""},
             {"index": 3, "purpose": "章末钩子", "opening_beat": "开场动作 3",
              "closing_beat": "悬念落点", "dominant_motifs": ["物件C"],
              "pov": "第三人称限知", "approximate_words": 300,
-             "time_marker": "锚点 3"},
+             "time_marker": "锚点 3",
+             "technical_setup": "", "technical_payoff": ""},
         ],
         "transition_notes": ["场景 1→2 用物件过渡", "场景 2→3 用时间过渡"],
         "revision": 0,

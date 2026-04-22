@@ -27,7 +27,9 @@ class UserInput(BaseModel):
     #   v4 = V4 场景分解（L2_i → L2.5_i 场景列表 → L3_{i,s} 逐场景写作 + continuity 审头）
     #   v5 = V5 premise 忠实度（+ visual_anchors / time_markers / tracked_objects /
     #                          character status · 四个 state-tracking 维度）
-    pipeline_version: Literal["v1", "v2", "v3", "v4", "v5"] = "v1"
+    #   v6 = V6 叙事承诺 + 势力图谱（+ plot_promises / character.faction /
+    #                             SceneOutline.technical_setup/payoff · 解决"死子未引爆"和"阵营混乱"）
+    pipeline_version: Literal["v1", "v2", "v3", "v4", "v5", "v6"] = "v1"
     # V4: L2.5 场景分解层的软目标——每章 3-5 场景，LLM 在此范围内自由决定
     scenes_per_chapter_hint: int = Field(4, ge=2, le=8)
 
@@ -60,6 +62,8 @@ class L1Skeleton(BaseModel):
     # V5: premise 忠实度硬约束
     visual_anchors: list[str] = Field(default_factory=list)      # 3-5 条必保视觉/超自然呈现画面
     tracked_object_names: list[str] = Field(default_factory=list) # 2-5 个跨章追踪的关键物件名
+    # V6: 叙事承诺（非视觉的情节机巧，如"埋三颗跨越十年的死子"）
+    plot_promises: list[PlotPromise] = Field(default_factory=list)  # 3-5 条
 
 
 class L2ChapterOutline(BaseModel):
@@ -74,6 +78,9 @@ class L2ChapterOutline(BaseModel):
     # V2: 伏笔账本（autonovel 的 canon.md 思路）
     foreshadow_planted: list[str] = Field(default_factory=list)  # 本章新埋伏笔（需要在后续兑现）
     foreshadow_paid: list[str] = Field(default_factory=list)      # 本章兑现的前面章节的伏笔
+    # V6: plot_promise 分配 —— 本章要 setup/payoff 的 promise.id 列表
+    promise_setups: list[str] = Field(default_factory=list)       # 如 ["fs_1"]
+    promise_payoffs: list[str] = Field(default_factory=list)      # 如 ["fs_2", "fs_3"]
 
 
 class L3ChapterDraft(BaseModel):
@@ -127,6 +134,8 @@ class CharacterState(BaseModel):
     # V5: 存续状态 · 影响笔法（gone 角色不得直接现身）
     status: Literal["active", "fading", "gone"] = "active"
     reliability: float = Field(1.0, ge=0.0, le=1.0)            # 记忆可信度（0=完全遗忘）
+    # V6: 势力阵营 · 解决多股势力角色身份混淆（如顾府暗桩 vs 沈家暗桩）
+    faction: str = ""                                          # 「顾府」「沈家」「官方」「中立」等自由文本
 
 
 class WorldFact(BaseModel):
@@ -134,6 +143,24 @@ class WorldFact(BaseModel):
     category: Literal["rule", "location", "item", "relationship", "event"]
     content: str                                               # ≤60 字
     ch_introduced: int                                         # 引入章节
+
+
+class PlotPromise(BaseModel):
+    """V6 叙事承诺 · 跨章节情节机巧追踪。
+
+    与 visual_anchors 的区别：
+    - visual_anchors 兜"具体视觉画面"（如"泥塑裂纹"「三碗酒同时见底」）
+    - plot_promises 兜"叙事承诺"（如"埋三颗跨越十年的死子"「主角佯装不懂兵法」）——
+      是情节机巧 / 专业伏笔，不是画面。
+
+    V5 demo 暴露的病灶：premise「埋下数颗跨越十年的"死子"」这种叙事承诺被 visual_anchors 漏抽，
+    正文完全没兑现（"死子"在 7097 字里 0 次出现）。V6 用 PlotPromise 兜住。
+    """
+    id: str                                                    # 稳定引用：「fs_1」「fs_2」
+    content: str                                               # ≤50 字叙事承诺描述
+    setup_ch: int = 0                                          # 应埋设章节（L2 分配，0=未分配）
+    payoff_ch: int = 0                                         # 应兑现章节（L2 分配，0=未分配）
+    fulfilled: bool = False                                    # 是否真正兑现（由 bible_update 报告后置为 True）
 
 
 class TrackedObject(BaseModel):
@@ -166,6 +193,8 @@ class WorldBible(BaseModel):
     tracked_objects: list[TrackedObject] = Field(default_factory=list)
     fulfilled_anchors: list[str] = Field(default_factory=list)   # 各章 bible_update 报告已兑现的
     time_markers_used: list[str] = Field(default_factory=list)   # 全书按章 append 的 time_marker 序列
+    # V6: 叙事承诺账本 · 从 L1.plot_promises copy，各章 bible_update 更新 setup_ch/payoff_ch/fulfilled
+    plot_promises: list[PlotPromise] = Field(default_factory=list)
 
 
 class BibleUpdate(BaseModel):
@@ -182,6 +211,9 @@ class BibleUpdate(BaseModel):
     object_state_changes: list[TrackedObject] = Field(default_factory=list)       # 本章物件状态变化
     character_status_changes: list[CharacterState] = Field(default_factory=list)  # 本章角色存续变更
     visual_anchors_fulfilled: list[str] = Field(default_factory=list)             # 本章实现的 anchor（字面对齐 bible.visual_anchors）
+    # V6: 叙事承诺增量
+    promise_setups_done: list[str] = Field(default_factory=list)                  # 本章实际 setup 的 promise.id
+    promise_payoffs_done: list[str] = Field(default_factory=list)                 # 本章实际 payoff 的 promise.id（兑现）
 
 
 # ============ V4: 场景分解层（L2.5） ============
@@ -196,6 +228,9 @@ class SceneOutline(BaseModel):
     approximate_words: int = Field(300, ge=100, le=1500)        # 目标字数
     # V5: 全局时间轴锚点（跨章单调递进，L2.5 分配，L3 严格遵守）
     time_marker: str = ""                                       # 如"鸡鸣前"/"第一声鸡鸣"/"天光微白"
+    # V6: 技术性伏笔 · 解决"靠真气喷血而非靠棋理/死子"式的题材失真
+    technical_setup: str = ""                                   # 如"白72手留下看似失误的死子"；可引用 promise.id
+    technical_payoff: str = ""                                  # 如"引爆白72手死子击溃顾衍之"；可引用 promise.id
 
 
 class ChapterSceneList(BaseModel):
@@ -239,6 +274,8 @@ class FinalVerdict(BaseModel):
     slop_avg: float = 0.0                                    # 各章 slop 平均分
     # V5: premise 视觉锚点未兑现清单（非空 → engine 强制 bounce 不尊重 usable=True）
     unfulfilled_anchors: list[str] = Field(default_factory=list)
+    # V6: 未兑现叙事承诺清单（非空 → engine 同样强制 bounce）
+    unfulfilled_promises: list[str] = Field(default_factory=list)
 
 
 class NovelState(BaseModel):
