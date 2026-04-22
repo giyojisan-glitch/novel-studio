@@ -5,9 +5,9 @@
 
 ---
 
-## 1. 核心思路（五层创新）
+## 1. 核心思路（六层创新）
 
-对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在五个维度：
+对标 gpt-author / AI_NovelGenerator / autonovel 等开源项目，NOVEL-Studio 的差异点在六个维度：
 
 ### 1.1 多层状态机（对标扩散模型）
 
@@ -159,6 +159,95 @@ bible_update_i → 下一章 L2 → ...
 - 换来的是**真正可读的长篇**（前面 8 章 Doubao run 写得再好，节奏断裂就是不能上）
 
 **当前状态**（2026-04-21）：V4 五个 commit 已落地。Schema + engine + prompts + audit head + artifacts + CLI + 179 tests 全绿。真 LLM 5 章验证是下一步（预估 ~30 min，~70 调用）。
+
+### 1.6 V5 premise 忠实度：视觉锚点 + 时间轴 + 物件状态 + 角色存续
+
+**V4 真 LLM 5 章跑完后（2026-04-22），外部审稿 Agent 拿完整架构文档对照成品做了诊断**，发现 4 个架构级漏洞——V4 防住了冷开场，但**信息维度不够**，还有些 premise 硬承诺系统性地漏掉：
+
+| 外部 Agent 发现的病灶 | 根因 | 实际例子 |
+|---|---|---|
+| **视觉锚点丢失** | bible_init 只从 world_rules 抽事实，premise 里的**具体视觉画面**无 schema 位置 | premise「父亲化作泥塑上的裂纹」 → V4 成品只写「父亲淡了」 |
+| **跨章时间轴失控** | SceneCard 没有全局进度锚点 | 正文「三声鸡鸣」跑了 2.5 轮（CH2 末第三声 → CH4 开第一声重启） |
+| **关键物件状态分裂** | WorldFact 只记"存在"不记 current_state | premise「三碗酒」对称 → V4 只写左碗裂，另两碗无状态 |
+| **角色 obsolescence 缺失** | CharacterState 只有 active 一种状态 | V4 结尾主角"忘父亲面容"，但 bible 仍硬记"左眉旧疤" |
+
+**V5 做法**：加 4 个正交的 state-tracking 维度。不动 V4 的任何机制（路由/多尺度 context/场景分解/continuity 审头全保留），只新增 4 种信息流动。
+
+```python
+# L1 扩展
+class L1Skeleton:
+    visual_anchors: list[str]          # 3-5 条 premise 必保视觉画面（L1 从 premise 抽）
+    tracked_object_names: list[str]    # 2-5 个跨章追踪的关键物件名
+
+# WorldBible 扩展
+class WorldBible:
+    visual_anchors: list[str]          # 从 L1 copy（不可变）
+    fulfilled_anchors: list[str]       # 按章累积：LLM 每章报告已兑现的
+    tracked_objects: list[TrackedObject]  # 每个物件的 current_state + state_history
+    time_markers_used: list[str]       # 全书按场景顺序的时间锚点列表
+
+# CharacterState 扩展
+class CharacterState:
+    status: Literal["active", "fading", "gone"]   # 存续状态
+    reliability: float                             # 0-1 记忆可信度
+
+# SceneOutline 扩展
+class SceneOutline:
+    time_marker: str   # L2.5 分配；跨章单调递进
+
+# BibleUpdate 扩展
+class BibleUpdate:
+    object_state_changes: list[TrackedObject]
+    character_status_changes: list[CharacterState]
+    visual_anchors_fulfilled: list[str]    # 本章兑现了哪些 anchor
+
+# FinalVerdict 扩展
+class FinalVerdict:
+    unfulfilled_anchors: list[str]         # 非空 → engine 强制 bounce
+```
+
+**4 条强制链路**：
+
+1. **Visual anchors 全链路追踪**
+   - L1 prompt 强制要求从 premise 抽 3-5 条具体可视化画面（「泥塑裂纹」「三碗见底」），反例禁收（「主题」「归途」这种抽象不要）
+   - bible_init 原样 copy 到 WorldBible.visual_anchors
+   - 每章 L3 prompt 里 `_unfulfilled_anchors_block` 列出未兑现的，提示合适时兑现
+   - bible_update prompt 要求本章 `visual_anchors_fulfilled` 字面对齐 bible.visual_anchors
+   - final_audit prompt 注入完整兑现状态对照组，要求填 `unfulfilled_anchors`
+   - **Engine 兜底**：apply_responses(final_audit) 检测到 `unfulfilled_anchors` 非空 → 强制 `usable=False, suspect=L3`，即使 LLM 错误标 usable=True 也翻转
+
+2. **Time markers 单调递进**
+   - L2.5 prompt 注入 `_prior_time_markers_block`（全书已用过的 markers），约束本章所有 scenes.time_marker 单调递进、不与前面章节冲突
+   - L3 scene prompt 把本场 time_marker 作为**硬落点**（禁推进超过 / 禁回退早于）
+   - Engine 在 apply L25 时把新 markers append 到 bible.time_markers_used
+   - Continuity 审头新增检查「本章 markers 是否单调？是否与上一章末衔接？」
+
+3. **Tracked objects 状态一致**
+   - L1 declare 哪些物件要追踪；bible_init 初始化为 `current_state="初始 / 未使用"`
+   - 每章 L3 prompt 注入 `_render_tracked_objects_block` 展示所有追踪物件当前状态
+   - 硬约束：正文描写不得与 current_state 矛盾（如 bible 记"左碗已裂"，正文不得写"三碗皆完好"）
+   - bible_update 抽取 `object_state_changes`，apply_bible_update 合并（按 name upsert；追加 state_history）
+   - Continuity 头新增检查「正文对 tracked_objects 的描写是否一致」
+
+4. **Character status/reliability 影响笔法**
+   - CharacterState 多两字段：`status ∈ {active, fading, gone}`, `reliability ∈ [0,1]`
+   - bible_update 可通过 `character_status_changes` 把角色转为 fading/gone（通常在 visual_anchor 兑现时——如"父亲成裂纹"=父亲 gone）
+   - L3 scene prompt 里 `_character_status_hints_block` 显式给出笔法指令：
+     - `fading` → 模糊笔法 / 只在回忆中
+     - `gone` → 禁止直接现身 / 通过遗物或他人回忆
+   - 避免 V4 里"系统记得但主角忘了"的认知失调
+
+**关键设计决策**：
+
+1. **不加新 audit head**：continuity 头已经有 5 项检查，V5 扩充到 8 项，不加新 head → aggregator 不动、成本不变、测试简单
+2. **engine 双重保险**：final_audit 既在 prompt 里要求 LLM 填 `unfulfilled_anchors`，也在 engine 层检测到非空强制 bounce——防止 LLM 错误标 usable=True 漏检
+3. **L1 集成不是独立 LLM 步**：visual_anchors 由 L1 一次产出，bible_init 保持合成（零额外 LLM 调用）
+4. **time_marker 自由文本不枚举**：不同 genre 的时间锚点不同（志怪=鸡鸣；科幻=宇航日；武侠=朝阳三丈），让 LLM 自己挑合适的短语，engine 只保证序列单调性
+5. **状态变更链式**：visual_anchor 兑现 → bible_update 报告 → 对应角色自动 fading/gone → 下一章 L3 写作笔法自动调整
+
+**增加的 LLM 调用**：**零**。V5 不加任何新 step，只在现有 prompt 里加注入块 + 扩充 schema 字段。
+
+**当前状态**（2026-04-22）：V5 五个 commit 已落地。Schema + engine + prompts + artifacts + CLI + 208 tests 全绿。外部审稿 Agent 标定的 4 条病灶都在架构层面有对应机制。真 LLM 5 章验证是下一步（对比 V4 demo `San_Wan_Jiu_20260422-002914.md`）。
 
 ---
 

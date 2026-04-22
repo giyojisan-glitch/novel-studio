@@ -90,9 +90,10 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 - ✅ **Lora-style Inspiration RAG**: `inspirations/{author}/*.txt` → BAAI/bge-large-zh-v1.5 embeddings → Chroma → auto-injected into L3 prompts as style references. See [`docs/TRAINING_METHODOLOGY.md`](docs/TRAINING_METHODOLOGY.md) for A/B validation results.
 - ✅ **V3 long-form pipeline** (`--pipeline v3`): interleaved L2/L3 (each chapter outline sees the real prose of prior chapters) + **WorldBible** (per-chapter `bible_update` extracts new characters, facts, timeline events, and foreshadow state; bible is injected as context into subsequent L2/L3 prompts). Supports up to 30 chapters.
 - ✅ **V4 scene decomposition + multi-scale continuity** (`--pipeline v4`): adds an L2.5 layer that breaks each chapter into 3-5 scenes with explicit opening/closing beats. L3 writes scene-by-scene; each scene prompt sees a CNN-style **multi-scale context** (last 400 chars of prev scene at high resolution, prior scene beats at mid resolution, last 3 chapters' closing at low resolution) + an **anti-cold-open hard constraint** that forbids chapter-restart templates ("指节攥得发白"). New **continuity audit head** (alongside logic + pace) scores cross-scene/cross-chapter handoff. L2 prompts now actually see the 800-char tail of the previous chapter's last scene (V3's half-kept interleaved promise finally fulfilled).
+- ✅ **V5 premise fidelity** (`--pipeline v5`): four state-tracking mechanisms address the drift bugs surfaced by an external review of V4's first novel (missing visual anchors, repeated cockcrow timeline, partial object states, missing character-obsolescence mechanic). L1 extracts **`visual_anchors`** from premise (concrete must-keep images like 「父亲化作泥塑裂纹」); L2.5 assigns a **`time_marker`** per scene with monotonic progression enforced across chapters; **`tracked_objects`** maintain current state cross-chapter and L3 must not contradict; **character `status`** (active/fading/gone) + `reliability` drive writing-style shifts for disappearing characters. Continuity audit reads bible state as ground truth. `final_audit` explicitly checks anchor fulfillment and engine force-bounces if `unfulfilled_anchors` non-empty. **Recommended for long-form**.
 - ✅ Artifacts export (every layer's output is human-readable)
 - ✅ CLI with init/step/status/artifacts/inspire commands
-- ✅ 182 unit tests green
+- ✅ 208 unit tests green
 
 ### A/B validated signals (see `docs/TRAINING_METHODOLOGY.md`)
 
@@ -102,9 +103,9 @@ But there's a catch — **the MVP currently runs only inside a Claude Code sessi
 
 ### What's missing (and why it's hard)
 
-1. **3 audit heads (logic + pace + continuity for V4).** Still missing character-consistency and style heads that the original design called for.
-2. **V4 not yet battle-tested on real LLM.** Full stack (schema + engine + prompts + audit + artifacts) passes all 182 stub tests; a real-model validation run (5-10 chapters with Doubao) is the next empirical check.
-3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3/V4 work.
+1. **3 audit heads (logic + pace + continuity).** Still missing character-consistency and style heads that the original design called for.
+2. **V5 not yet battle-tested on real LLM.** V4 5-chapter demo ran to completion; V5 adds targeted anti-drift mechanisms but the combined impact on 10-chapter output is unverified.
+3. **Chapters are still sequential within L3.** True parallel chapter generation with shared blackboard state is orthogonal to V3/V4/V5 work.
 4. **Chinese-first.** Prompts and style packs are in Mandarin. Architecture is language-agnostic; porting is a translation task.
 5. **UX rough edges**: `step` doesn't remember the `--provider` chosen at `init`, must be passed each call.
 
@@ -197,12 +198,19 @@ uv run novel-studio init --file inputs/my_novel.md \
     --genre 志怪 --chapters 10 --words 1500 \
     --provider doubao --pipeline v3
 
-# V4 recommended for long-form (adds L2.5 scene decomposition +
-# multi-scale context + continuity audit). --scenes-per-chapter is a
-# soft target (LLM picks final count in 3-5 range).
+# V4 for long-form (L2.5 scene decomposition + multi-scale context
+# + continuity audit). --scenes-per-chapter is a soft target (LLM
+# picks final count in 3-5 range).
 uv run novel-studio init --file inputs/my_novel.md \
     --genre 志怪 --chapters 10 --words 1500 \
     --provider doubao --pipeline v4 --scenes-per-chapter 4
+
+# V5 recommended for shippable long-form (V4 + premise fidelity
+# mechanisms: visual_anchors, time_markers, tracked_objects, 
+# character status tracking).
+uv run novel-studio init --file inputs/my_novel.md \
+    --genre 志怪 --chapters 10 --words 1500 \
+    --provider doubao --pipeline v5 --scenes-per-chapter 4
 
 # Advance (for auto providers one call per stage):
 uv run novel-studio step projects/{timestamp}/ --provider doubao
@@ -263,6 +271,52 @@ bible_update_i           (same as V3)
 Artifacts produced (all human-readable):
 - `artifacts/{slug}/07_scene_lists.md` — the L2.5 per-chapter scene design
 - `artifacts/{slug}/08_scene_cards.md` — design vs actual comparison (what LLM wrote vs what was planned)
+
+### V5 premise fidelity
+
+After V4's first 5-chapter production run, an external review identified four architectural-level drift bugs that V4's 3-head audit couldn't catch:
+
+1. **Missing visual anchor**: premise said "父亲走进庙里，成了泥塑上的一道裂纹" (father becoming a crack in the clay idol — the key ending image). V4 rendered father as "淡了" (faded). The visual was never extracted into bible as a hard commitment.
+2. **Timeline restart**: premise involved "三声鸡鸣" as time progression. V4's chapters ran *two and a half complete cockcrow cycles* because each L3 scene locally rebuilt pacing without seeing global progress.
+3. **Object state collapse**: premise emphasized "三碗酒" symbolizing three debts. V4 resolved only the leftmost bowl; the other two were never given symmetric state transitions.
+4. **No character obsolescence**: V4's ending had the protagonist forgetting his father (poetic), but bible still recorded 左眉旧疤 firmly. Ch6+ would mismatch.
+
+V5 adds four orthogonal state-tracking fields:
+
+```
+L1 骨架                          + visual_anchors: list[str]      ← L1 extracts from premise
+                                 + tracked_object_names: list[str]
+ └── bible_init                  copies visual_anchors + seeds tracked_objects
+
+for chapter i:
+  L2_i outline
+   └── L2_audit
+
+  L2.5_i scene list              each scene gets time_marker
+   └── L25_audit                  (monotonic across book · bible tracks全局列表)
+
+  for scene s in 1..M_i:
+    L3_{i,s}                     + time_marker 硬约束 (禁推进 / 禁回退)
+                                 + tracked_objects 当前状态注入 (不得矛盾)
+                                 + character status hints (fading/gone 影响笔法)
+                                 + unfulfilled_anchors 提示 (合适时兑现)
+
+  L3 chapter_audit (continuity head extended with 3 V5 checks:
+                    time_marker monotonic; tracked_objects consistent;
+                    anchor fulfillment appropriate)
+
+  bible_update_i                 + object_state_changes
+                                 + character_status_changes
+                                 + visual_anchors_fulfilled
+
+final_audit                      + 强制检查 unfulfilled_anchors
+  engine (not LLM!) force-bounces if non-empty → suspect=L3 → L4 waits
+```
+
+**Why state-tracking not prompt-tweaking**: the external review showed that V4's prose instincts are already good — the failures were *structural*. The LLM didn't know 泥塑裂纹 was non-negotiable, didn't know time was monotonic across chapters, didn't know two bowls remained intact. V5 moves these from "hopefully LLM remembers" to "bible records + prompt injects at every relevant step + audit checks + final enforcement".
+
+New artifact:
+- `artifacts/{slug}/09_visual_anchors.md` — each anchor's ✅/⏳ status. If anything's ⏳ when final_audit runs, engine bounces.
 
 ### Seed the inspiration library (Lora-style style transfer)
 
