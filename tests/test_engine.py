@@ -650,6 +650,79 @@ class TestV5FinalAuditEnforcement:
         assert state.final_verdict.usable is True  # 默认 stub 返 True
 
 
+class TestV5PromptContent:
+    """V5 prompt 渲染包含新注入块（time_marker 硬约束、tracked_objects、角色 status、
+    unfulfilled anchors）。"""
+
+    def _v5_state(self):
+        s = _make_state("v5", chapters=3)
+        # 补 L1 的 V5 字段
+        s.l1.visual_anchors = ["A 视觉", "B 视觉"]
+        s.l1.tracked_object_names = ["三碗酒", "木牌"]
+        s.world_bible = P.build_initial_bible(s.l1)
+        s.world_bible.time_markers_used = ["鸡鸣前", "第一声鸡鸣"]
+        return s
+
+    def test_l1_prompt_requires_visual_anchors(self):
+        s = self._v5_state()
+        prompt = P.l1_prompt(s)
+        assert "visual_anchors" in prompt
+        assert "tracked_object_names" in prompt
+        assert "父亲化作泥塑上的裂纹" in prompt  # 正例
+
+    def test_l25_prompt_lists_prior_time_markers(self):
+        s = self._v5_state()
+        s.l2.append(L2ChapterOutline(index=2, title="c2", summary="s", hook="h",
+                                     pov="p", key_events=["e"], prev_connection="pc"))
+        prompt = P.l25_prompt(s, chapter_idx=2)
+        assert "全局时间轴锚点" in prompt or "time_markers" in prompt
+        assert "鸡鸣前" in prompt and "第一声鸡鸣" in prompt
+        assert "单调递进" in prompt
+
+    def test_l3_scene_prompt_has_hard_time_marker(self):
+        s = self._v5_state()
+        # 添加 L2 + L2.5
+        s.l2.append(L2ChapterOutline(index=1, title="c1", summary="s", hook="h",
+                                     pov="p", key_events=["e"], prev_connection="pc"))
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c",
+                          approximate_words=300, time_marker="第二声鸡鸣")
+        s.scene_lists.append(ChapterSceneList(chapter_index=1, scenes=[so]))
+        import os
+        os.environ["NOVEL_STUDIO_NO_RAG"] = "1"
+        try:
+            prompt = P.l3_scene_prompt(s, chapter_idx=1, scene_idx=1)
+        finally:
+            os.environ.pop("NOVEL_STUDIO_NO_RAG", None)
+        assert "第二声鸡鸣" in prompt
+        assert "禁止推进超过此 marker" in prompt
+        # tracked_objects 当前状态注入
+        assert "三碗酒" in prompt and "初始 / 未使用" in prompt
+        # unfulfilled anchors 列出
+        assert "A 视觉" in prompt
+
+    def test_l3_scene_prompt_renders_fading_character(self):
+        s = self._v5_state()
+        # 手动添加 fading 角色
+        s.world_bible.characters.append(
+            CharacterState(name="沈父", status="fading", reliability=0.5)
+        )
+        s.l2.append(L2ChapterOutline(index=1, title="c1", summary="s", hook="h",
+                                     pov="p", key_events=["e"], prev_connection="pc"))
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c",
+                          approximate_words=300, time_marker="第二声鸡鸣")
+        s.scene_lists.append(ChapterSceneList(chapter_index=1, scenes=[so]))
+        import os
+        os.environ["NOVEL_STUDIO_NO_RAG"] = "1"
+        try:
+            prompt = P.l3_scene_prompt(s, chapter_idx=1, scene_idx=1)
+        finally:
+            os.environ.pop("NOVEL_STUDIO_NO_RAG", None)
+        assert "角色存续状态" in prompt
+        assert "fading" in prompt
+        assert "沈父" in prompt
+        assert "模糊笔法" in prompt
+
+
 class TestV5PipelineSmoke:
     """StubProvider 跑 V5 pipeline · 3 章 × 3 场景（V5 沿用 V4 路由）。"""
 

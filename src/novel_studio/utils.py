@@ -50,7 +50,34 @@ def export_artifacts(state: NovelState, pdir: Path) -> Path:
         (adir / "07_scene_lists.md").write_text(_render_scene_lists(state), encoding="utf-8")
     if state.scene_cards:
         (adir / "08_scene_cards.md").write_text(_render_scene_cards(state), encoding="utf-8")
+    # V5: premise 视觉锚点兑现追踪（独立 artifact 便于人眼审核）
+    if state.world_bible and state.world_bible.visual_anchors:
+        (adir / "09_visual_anchors.md").write_text(_render_visual_anchors(state), encoding="utf-8")
     return adir
+
+
+def _render_visual_anchors(state: NovelState) -> str:
+    """V5 premise 视觉锚点兑现状态。"""
+    wb = state.world_bible
+    L = ["# Visual Anchors · Premise 忠实度追踪（V5）\n"]
+    L.append("> L1 从 premise 抽取的必保视觉画面。每条必须在某章**具体写出来**才算 fulfilled。\n")
+    L.append("---\n")
+    fulfilled = set(wb.fulfilled_anchors)
+    for anchor in wb.visual_anchors:
+        status = "✅ 已兑现" if anchor in fulfilled else "⏳ 未兑现"
+        L.append(f"## {status}  —  {anchor}")
+        L.append("")
+    # Unfulfilled 汇总
+    unfulfilled = [a for a in wb.visual_anchors if a not in fulfilled]
+    if unfulfilled:
+        L.append("---\n")
+        L.append(f"## ⚠️ 未兑现（{len(unfulfilled)}/{len(wb.visual_anchors)}）")
+        L.append("若 final_audit 跑完后本清单非空，engine 会强制 bounce 回 L3 重写。")
+    else:
+        L.append("---\n")
+        L.append("## ✅ 全部兑现")
+    L.append("")
+    return "\n".join(L)
 
 
 def _render_scene_lists(state: NovelState) -> str:
@@ -69,6 +96,8 @@ def _render_scene_lists(state: NovelState) -> str:
                 L.append(f"- **核心意象**：{'、'.join(sc.dominant_motifs)}")
             if sc.pov:
                 L.append(f"- **视角**：{sc.pov}")
+            if sc.time_marker:
+                L.append(f"- **⏳ time_marker**（V5）：`{sc.time_marker}`")
             L.append("")
         if csl.transition_notes:
             L.append("### 转场注记")
@@ -169,6 +198,35 @@ def _render_world_bible(state: NovelState) -> str:
     else:
         L.append("（无）")
     L.append("")
+
+    # V5: 视觉锚点兑现追踪
+    if b.visual_anchors:
+        L.append("## V5 · Visual Anchors（premise 必保视觉）")
+        fulfilled = set(b.fulfilled_anchors)
+        for a in b.visual_anchors:
+            marker = "✅" if a in fulfilled else "⏳"
+            L.append(f"- {marker} {a}")
+        L.append("")
+
+    # V5: tracked_objects 当前状态
+    if b.tracked_objects:
+        L.append("## V5 · 被追踪物件（跨章状态机）")
+        for obj in b.tracked_objects:
+            L.append(f"### {obj.name}")
+            L.append(f"- **当前状态**：{obj.current_state}")
+            L.append(f"- **最后变更**：第 {obj.last_changed_ch} 章")
+            if obj.state_history:
+                L.append("- **历史**：")
+                for h in obj.state_history:
+                    L.append(f"  - {h}")
+            L.append("")
+
+    # V5: time_markers_used（全书时间进度条）
+    if b.time_markers_used:
+        L.append("## V5 · 全书 Time Markers（按章按场景顺序）")
+        L.append(" → ".join(f"「{m}」" for m in b.time_markers_used))
+        L.append("")
+
     return "\n".join(L)
 
 
