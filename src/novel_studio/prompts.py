@@ -43,6 +43,14 @@ L1_TASK = """## 任务
 3. `three_act` 每幕 ≤ 60 字，三幕之间是因果链（不是并列）
 4. `world_rules` 3-5 条，必须是能约束后续情节的硬规则（如"力量有代价"）
 5. 反派可选；若有，`want` 要和主角对立
+6. **V5 必填** `visual_anchors`（3-5 条）：premise 明确要求或强烈暗示的**具体可目视的视觉/超自然呈现画面**
+   - 必须是能**拍出来**的具体画面，不是抽象主题
+   - 正例：「父亲化作泥塑上的裂纹」「三碗酒同时见底」「书生袖里多出三枚铜钱」
+   - 反例：「父子情」「归途」「旧债清讫」（这些是主题不是视觉）
+   - 若 premise 明示结尾画面 / 超自然呈现方式 / 象征物件，**必须全部进 visual_anchors**
+7. **V5 必填** `tracked_object_names`（2-5 个）：正文里会反复出现且状态会变化的**关键物件名**
+   - 如「三碗酒」「半块木牌」「泥塑土地公」
+   - 不包含一次性道具（鞋、书箱）或通用元素（雨、风）
 
 ## 输出
 严格 JSON，符合以下 schema：
@@ -514,6 +522,79 @@ def _v3_active(state: NovelState) -> bool:
     return state.user_input.pipeline_version == "v3"
 
 
+def _v5_active(state: NovelState) -> bool:
+    """V5 激活：prompt 要加视觉锚点/time_marker/tracked_objects/character status 注入块。"""
+    return state.user_input.pipeline_version == "v5"
+
+
+# ============ V5 辅助函数 · 多个 prompt 共用 ============
+
+def _prior_time_markers_block(state: NovelState) -> str:
+    """V5 L2.5 用：前面章节已用过的 time_markers 列表。"""
+    wb = state.world_bible
+    if wb is None or not wb.time_markers_used:
+        return "（本书第 1 章，暂无前序 time_markers）"
+    return "、".join(f"「{m}」" for m in wb.time_markers_used)
+
+
+def _render_tracked_objects_block(state: NovelState) -> str:
+    """V5 L3 用：把 bible.tracked_objects 的当前状态渲染成一段 context。"""
+    wb = state.world_bible
+    if wb is None or not wb.tracked_objects:
+        return ""
+    lines = ["\n\n## 📦 被追踪物件 · 当前状态（正文描写必须与此一致）"]
+    for obj in wb.tracked_objects:
+        hist = ""
+        if len(obj.state_history) >= 2:
+            hist = f"（历史：{' → '.join(obj.state_history[-3:])}）"
+        lines.append(f"- **{obj.name}**：{obj.current_state}{hist}")
+    lines.append("> 正文里再描写这些物件时，**不得与当前状态矛盾**（如已裂的碗不得复原）。")
+    return "\n".join(lines)
+
+
+def _character_status_hints_block(state: NovelState) -> str:
+    """V5 L3 用：角色存续状态（fading/gone 影响笔法）。"""
+    wb = state.world_bible
+    if wb is None:
+        return ""
+    non_active = [c for c in wb.characters if c.status != "active"]
+    if not non_active:
+        return ""
+    lines = ["\n\n## 🎭 角色存续状态（V5 · 影响描写笔法）"]
+    for c in non_active:
+        if c.status == "fading":
+            lines.append(
+                f"- **{c.name}** [fading · 可信度 {c.reliability:.1f}]："
+                f"只在回忆/间接提及中出现，描写用**模糊笔法**（具体细节模糊化）"
+            )
+        elif c.status == "gone":
+            lines.append(
+                f"- **{c.name}** [gone · 可信度 {c.reliability:.1f}]："
+                f"**不得直接现身**，只能通过遗物、他人回忆、物件触发提及"
+            )
+    return "\n".join(lines)
+
+
+def _unfulfilled_anchors_block(state: NovelState) -> str:
+    """V5 L3 用：提示本场景应考虑兑现的 visual_anchors（未兑现的）。"""
+    wb = state.world_bible
+    if wb is None or not wb.visual_anchors:
+        return ""
+    fulfilled = set(wb.fulfilled_anchors)
+    unfulfilled = [a for a in wb.visual_anchors if a not in fulfilled]
+    if not unfulfilled:
+        return ""
+    lines = ["\n\n## 🎯 premise 视觉锚点 · 未兑现列表（必保细节）"]
+    for a in unfulfilled:
+        lines.append(f"- {a}")
+    lines.append(
+        "> 这些是 premise 明确或强烈暗示的**必保视觉画面**，整本书**必须**在某章真实出现"
+        "（不是概括，而是具体写出来）。若本场剧情正合适兑现，请**写出来**；"
+        "若不合适，留给后面章节——但**禁止整本书都不兑现**。"
+    )
+    return "\n".join(lines)
+
+
 def _final_audit_retry_block(state: NovelState) -> str:
     """若存在上一轮 final_audit 反馈（usable=False，退回到 L1/L2/L3），在 L2/L3 prompt 里注入。
 
@@ -695,6 +776,9 @@ def apply_bible_update(bible: WorldBible, update: BibleUpdate) -> WorldBible:
                 status=status_change.status,
                 reliability=status_change.reliability,
             )
+        else:
+            # 新角色且直接标为 fading/gone（容错：LLM 没先用 new_characters 加）
+            chars_by_name[status_change.name] = status_change
 
     # V5: 已兑现 anchors 追加（去重）
     existing_fulfilled = set(bible.fulfilled_anchors)
@@ -828,6 +912,24 @@ BIBLE_UPDATE_TASK = """## 任务
 7. `paid_foreshadow`：本章兑现的、来自前面章节的伏笔——**字面要尽量匹配 bible.active_foreshadow 里的原文**，让下一层能精确移除
 8. `consistency_issues`：本章和 bible 矛盾的具体地方（如"bible 说 X 不会飞，本章 X 飞了"）。没有就空数组
 
+### V5 必填增量字段（**若本章有相关变化，不得留空**）
+
+9. `object_state_changes`：本章对 bible.tracked_objects 里任一物件**状态的变化**
+   - 格式 `[{{"name": "三碗酒", "current_state": "左碗裂开", "last_changed_ch": {chapter_idx}}}]`
+   - 只写本章真正发生状态变化的物件；没变化的不填
+   - **name 必须与 bible.tracked_objects 里的 name 完全一致**
+
+10. `character_status_changes`：本章对已有角色的**存续状态变化**
+    - 角色消失 / 变模糊 / 只存在于回忆时：status=fading 或 gone，reliability 相应降
+    - 格式 `[{{"name": "沈父", "status": "gone", "reliability": 0.5, ...}}]`
+    - name 必须匹配 bible.characters 里的 name
+
+11. `visual_anchors_fulfilled`：本章实现了哪些 visual_anchors
+    - 从 bible.visual_anchors 列表里**逐字抄出**已兑现的条目（必须字面匹配）
+    - 判断标准：正文里**真的写出了这个视觉画面**（不是暗示、不是概括）
+    - 例：bible 有"父亲化作泥塑上的裂纹"；正文正好写了这个画面 → 填进这里
+    - 若本章未兑现任何 anchor，留空数组
+
 ## 输出
 严格 JSON：
 
@@ -931,7 +1033,31 @@ def final_audit_prompt(state: NovelState, full_markdown: str, slop_avg: float) -
         if slop_avg < 4.0
         else f"（平均 {slop_avg:.2f}，slop 已偏高，考虑让 L4 彻底清洗）"
     )
-    return FINAL_AUDIT_SYSTEM + "\n\n" + FINAL_AUDIT_TASK.format(
+
+    # V5: 视觉锚点强制检查块
+    v5_block = ""
+    if _v5_active(state) and state.world_bible is not None:
+        wb = state.world_bible
+        if wb.visual_anchors:
+            fulfilled = set(wb.fulfilled_anchors)
+            unfulfilled = [a for a in wb.visual_anchors if a not in fulfilled]
+            v5_block = (
+                "\n\n## 🎯 V5 · Visual Anchors 强制检查（premise 必保视觉）\n\n"
+                f"**premise 要求的 visual_anchors**（来自 L1 抽取）：\n"
+                + "\n".join(f"- {a}" for a in wb.visual_anchors)
+                + "\n\n**bible 已标记 fulfilled**：\n"
+                + ("\n".join(f"- {a}" for a in wb.fulfilled_anchors) if wb.fulfilled_anchors else "- （无）")
+                + "\n\n**尚未兑现 · 按理应出现在正文里**：\n"
+                + ("\n".join(f"- {a}" for a in unfulfilled) if unfulfilled else "- （全部已兑现）")
+                + "\n\n### 检查法\n"
+                "1. 通读 full_markdown，对每条 anchor 做搜索 / 识别：正文**真的写出了这个视觉画面**吗？\n"
+                "2. 只看「概括 / 暗示」不算兑现——必须是**具体可视化的段落**\n"
+                "3. 把真正**未兑现**（bible 标了已 fulfilled 但正文找不到 / bible 没标但你判断缺失）的 anchors 填进 `unfulfilled_anchors` 字段\n"
+                "4. **若 `unfulfilled_anchors` 非空**，必须 `usable=False, suspect_layer=L3, retry_hint` 里明确提到缺失项\n"
+                "5. 若全部兑现，`unfulfilled_anchors=[]`，按原有逻辑判整体 usable\n"
+            )
+
+    return FINAL_AUDIT_SYSTEM + v5_block + "\n\n" + FINAL_AUDIT_TASK.format(
         premise=ui.premise,
         genre=ui.genre,
         total_target=total_target,
@@ -1216,9 +1342,11 @@ L25_TASK = """## 任务
 ## 参考：前面章节的场景摘要（保证节奏不重复）
 {prior_scene_summaries}
 
+{v5_time_markers_block}
+
 ## 要求
 - `chapter_index` = {chapter_idx}
-- `scenes`：列表长度 3-5；每个 SceneOutline 含 index（1-based）/ purpose / opening_beat / closing_beat / dominant_motifs / pov / approximate_words
+- `scenes`：列表长度 3-5；每个 SceneOutline 含 index（1-based）/ purpose / opening_beat / closing_beat / dominant_motifs / pov / approximate_words{v5_scene_marker_req}
 - `transition_notes`：列出 N-1 条跨场景转场逻辑（每条 ≤30 字，如"场景 2→3 用三枚铜钱的触感过渡"）
 - 字数分配：所有场景 approximate_words 之和 ≈ {target_words}，最后一场景略长可放结尾
 
@@ -1231,6 +1359,22 @@ L25_TASK = """## 任务
 
 **只输出 JSON**，不要 markdown 包裹，不要解释。
 """
+
+
+V5_L25_TIME_MARKERS_BLOCK = """## ⏳ V5 · 全局时间轴锚点（跨章单调递进）
+
+**本书前面章节已用过的 time_markers**（按出现顺序）：
+{prior_markers}
+
+**本章规划约束**：
+- 本章每个 scene **必须**填 `time_marker`（短文本，如"鸡鸣前"/"第一声鸡鸣"/"第二声鸡鸣"/"天光微白"/"朝阳出山"）
+- 本章所有 time_markers **单调递进不倒退**、**不与前面章节已用过的冲突**（不能"倒带"）
+- 整本书的时间进度条只能**向前推进**，不得重启（例如已经用过"第三声鸡鸣"之后就不能再出"第一声鸡鸣"）
+- 若本章剧情与时间无直接关系（如插叙 / 回忆），用 `time_marker="【静止：{{本章主事件}}】"` 格式
+"""
+
+
+V5_SCENE_MARKER_REQ = "；**必填 V5: `time_marker`**（从上面的全局时间轴选一个未用过的、且严格晚于前面章节已用的）"
 
 
 L3_SCENE_ANTI_COLD_OPEN = """
@@ -1326,6 +1470,21 @@ CONTINUITY_AUDIT_TASK = """## 任务
 4. 主角情绪是否连续推进？有无"场景切换后情绪归零"的情况？
 5. 有无过度重复套路（如"指节攥得发白"出现 > 2 次）？
 
+### V5 新增检查项（基于 bible 状态对照）
+
+6. **time_marker 单调递进**：本章场景的 time_markers 是否一步步向前（不倒退、不复读）？
+   是否与**上一章末的 time_marker** 衔接（上一章已到"第三声鸡鸣"，本章不得回到"鸡鸣前"）？
+   正文里对时间/环境的描述是否与各场景的 time_marker 一致？
+   有无"三声鸡鸣跑两轮"之类的回放式错误？
+
+7. **tracked_objects 状态一致**：正文对 bible.tracked_objects 中每个物件的描写，
+   是否与其 `current_state` 一致？（如 bible 记"三碗酒：左碗已裂"，正文**不得**说"三碗皆完好"）
+   若本章对某物件产生了**新状态**，本审稿可通过 —— 但需留意是否矛盾于前面章节。
+
+8. **visual_anchors 兑现时机**：bible.visual_anchors 里若有"本章剧情应当兑现"的
+   （如 bible 列着"父亲化作泥塑裂纹"而本章正好是父亲离场章），**正文是否真写出来**？
+   若合适兑现而未兑现 → 直接扣分。
+
 ## 输出
 严格 JSON：
 
@@ -1364,6 +1523,16 @@ def l25_prompt(state: NovelState, chapter_idx: int) -> str:
 
     retry = _retry_hint(state, f"L25_{chapter_idx}")
 
+    # V5: 时间轴锚点块（单调递进约束）
+    if _v5_active(state):
+        v5_markers_block = V5_L25_TIME_MARKERS_BLOCK.format(
+            prior_markers=_prior_time_markers_block(state),
+        )
+        v5_scene_marker_req = V5_SCENE_MARKER_REQ
+    else:
+        v5_markers_block = ""
+        v5_scene_marker_req = ""
+
     return (
         _CREATIVITY_HEADER.get(ui.creativity, "")
         + _lang_meta_header(ui.language)
@@ -1379,6 +1548,8 @@ def l25_prompt(state: NovelState, chapter_idx: int) -> str:
             prior_scene_summaries=prior_summaries,
             target_words=ui.target_words_per_chapter,
             schema=schema_of(ChapterSceneList),
+            v5_time_markers_block=v5_markers_block,
+            v5_scene_marker_req=v5_scene_marker_req,
         )
         + (f"\n\n## 上轮审稿反馈（请针对性修正）\n{retry}" if retry else "")
         + _final_audit_retry_block(state)
@@ -1386,7 +1557,7 @@ def l25_prompt(state: NovelState, chapter_idx: int) -> str:
 
 
 def l3_scene_prompt(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
-    """V4 L3 单场景写作 · 多尺度上下文注入。"""
+    """V4 L3 单场景写作 · 多尺度上下文注入。V5 再加 time_marker / tracked_objects / status 注入。"""
     sl = next(x for x in state.scene_lists if x.chapter_index == chapter_idx)
     outline = next(s for s in sl.scenes if s.index == scene_idx)
     total_scenes = len(sl.scenes)
@@ -1401,14 +1572,34 @@ def l3_scene_prompt(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
 
     multi_scale = _scene_multi_scale_context(state, chapter_idx, scene_idx)
     scene_card = _scene_card_block(state, chapter_idx, scene_idx)
-    bible_block = _bible_context_block(state.world_bible, "L3") if _v3_active(state) or state.user_input.pipeline_version == "v4" else ""
+    pv = state.user_input.pipeline_version
+    bible_block = _bible_context_block(state.world_bible, "L3") if pv in ("v3", "v4", "v5") else ""
     retry = _retry_hint(state, f"L3_{chapter_idx}_{scene_idx}")
     final_audit_block = _final_audit_retry_block(state)
+
+    # V5: 时间轴硬约束 + 物件状态 + 角色存续 + 未兑现锚点
+    v5_blocks = ""
+    if _v5_active(state):
+        v5_time_block = (
+            f"\n\n## 🎯 V5 本场 time_marker（硬约束）\n"
+            f"- **本场必须落在**：`{outline.time_marker or '（L2.5 未指定——按本章当前时段写）'}`\n"
+            f"- **禁止推进超过此 marker**：不得写出比该锚点更晚的环境变化（如当前是「第一声鸡鸣」，禁止出现「天已大亮」）\n"
+            f"- **禁止回退早于此 marker**：不得描写比该锚点更早的环境状态\n"
+            f"- 全书时间轴已用过的 marker（这些是前面章节的，本场不得重启任何一个）：\n"
+            f"  {_prior_time_markers_block(state)}"
+        )
+        v5_blocks = (
+            v5_time_block
+            + _render_tracked_objects_block(state)
+            + _character_status_hints_block(state)
+            + _unfulfilled_anchors_block(state)
+        )
 
     return (
         l3_system_for(state.user_input.genre, state.user_input.language, state.user_input.creativity)
         + inspiration_block
         + bible_block
+        + v5_blocks
         + final_audit_block
         + "\n\n"
         + L3_SCENE_TASK.format(
@@ -1451,17 +1642,36 @@ def continuity_audit_prompt(state: NovelState, target_idx: int) -> str:
     else:
         prev_closing = "（本章是第 1 章，无上一章可对照）"
 
-    # 本章 L2.5 场景设计
+    # 本章 L2.5 场景设计（V5 后：包含 time_marker）
     sl = next((x for x in state.scene_lists if x.chapter_index == target_idx), None)
     if sl:
         outlines_text = "\n".join(
             f"- 场景 {o.index}：开场「{o.opening_beat}」→ 结尾「{o.closing_beat}」（{o.purpose}）"
+            + (f"  [V5 time_marker: {o.time_marker}]" if o.time_marker else "")
             for o in sl.scenes
         )
     else:
         outlines_text = "（无场景设计）"
 
-    return CONTINUITY_AUDIT_SYSTEM + "\n\n" + CONTINUITY_AUDIT_TASK.format(
+    # V5: 注入 bible 状态供审稿对照
+    v5_bible_context = ""
+    if _v5_active(state) and state.world_bible is not None:
+        wb = state.world_bible
+        parts = []
+        if wb.time_markers_used:
+            parts.append(f"- **全书时间轴已用 markers**（按顺序）：{'、'.join(wb.time_markers_used)}")
+        if wb.tracked_objects:
+            obj_lines = [f"  - {o.name}：{o.current_state}" for o in wb.tracked_objects]
+            parts.append("- **被追踪物件当前状态**（正文描写必须对齐）：\n" + "\n".join(obj_lines))
+        if wb.visual_anchors:
+            fulfilled = set(wb.fulfilled_anchors)
+            unfulfilled = [a for a in wb.visual_anchors if a not in fulfilled]
+            if unfulfilled:
+                parts.append(f"- **尚未兑现的 visual_anchors**（本章若合适应兑现）：{'、'.join(unfulfilled)}")
+        if parts:
+            v5_bible_context = "\n\n## 📊 V5 · Bible 状态对照组\n" + "\n".join(parts)
+
+    return CONTINUITY_AUDIT_SYSTEM + v5_bible_context + "\n\n" + CONTINUITY_AUDIT_TASK.format(
         chapter_idx=target_idx,
         prev_chapter_closing=prev_closing,
         chapter_content=chapter_content,
