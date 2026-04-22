@@ -260,10 +260,27 @@ def apply_responses(
         state.audit_history.append(verdict)
 
 
+_SCHEMA_META_KEYS = {
+    "type", "items", "properties", "required", "title", "description",
+    "default", "enum", "$ref", "$defs", "minimum", "maximum",
+    "anyOf", "allOf", "oneOf", "additionalProperties", "format", "pattern",
+}
+
+
+def _is_schema_shaped_dict(d: dict) -> bool:
+    """判断一个 dict 是否"长得像 schema 定义"——所有 key 都是 schema 元关键字。
+
+    如 `{"type": "integer"}` 是 schema-shaped；`{"name": "沈清"}` 是数据。
+    """
+    if not d:
+        return False
+    return all(k in _SCHEMA_META_KEYS for k in d.keys())
+
+
 def _looks_like_schema_envelope(data: dict) -> bool:
     """识别"LLM 把自己的 JSON Schema 当成 response shape 返回"这个典型 bug。
 
-    两种已知 Doubao 形态：
+    三种已知 Doubao 形态：
 
     Shape A（V4 final_audit 观察到 · 数据塞在 value 里）：
         {"type": "object",
@@ -281,6 +298,14 @@ def _looks_like_schema_envelope(data: dict) -> bool:
          },
          "required": ["chapter_index", ...]}
 
+    Shape C（V5 bible_update 观察到 · 真数据直接塞在 properties 里）：
+        {"$defs": {...},
+         "properties": {
+           "chapter_index": 2,
+           "new_characters": [{"name": "沈清", ...}]
+         },
+         "required": ["chapter_index"]}
+
     正确 shape 应该是扁平 `{"field": value, ...}`。
     """
     if not isinstance(data, dict):
@@ -296,46 +321,53 @@ def _looks_like_schema_envelope(data: dict) -> bool:
     ):
         return True
 
-    # Shape B：纯 schema，properties 条目全是 schema-like（有 type，没 value）
+    # Shape B / C：顶层有 schema 标志字段（$defs / required / type=object）
     has_schema_sibling = (
         "$defs" in data or "required" in data or data.get("type") == "object"
     )
-    schema_like_props = all(
-        isinstance(v, dict) and "type" in v and "value" not in v
-        for v in props.values()
-    )
-    return has_schema_sibling and schema_like_props
+    return has_schema_sibling
 
 
 def _unwrap_schema_envelope(data: dict) -> dict:
     """把 {type/properties/required} 壳展平成 {field: value}。
 
-    Shape A：有 value/default → 提取
-    Shape B：纯 schema 无数据 → raise ValueError 触发上游重跑
+    Shape A：props 条目全是 {"value": ...} → 提取 value/default
+    Shape C：props 条目已是真数据（scalar / list / 数据 dict） → 直接返回 props
+    Shape B：props 条目全是 schema 定义（无数据） → raise ValueError 触发上游重跑
     """
     props = data["properties"]
-    # Shape A detection
-    has_data = any(
+
+    # Shape A：所有值都是 {"value": ...} 或 {"default": ...}
+    if all(
         isinstance(v, dict) and ("value" in v or "default" in v)
         for v in props.values()
+    ):
+        out: dict = {}
+        for k, meta in props.items():
+            if not isinstance(meta, dict):
+                continue
+            if "value" in meta:
+                out[k] = meta["value"]
+            elif "default" in meta:
+                out[k] = meta["default"]
+        return out
+
+    # 区分 B vs C：任一 prop 值"不是 schema 形" → C（真数据直接在 props 里）
+    has_real_data = any(
+        not isinstance(v, dict) or not _is_schema_shaped_dict(v)
+        for v in props.values()
     )
-    if not has_data:
-        # Shape B：doubao 把 schema 本身当响应返回，根本没数据
-        raise ValueError(
-            "Doubao 返回了纯 JSON Schema 壳（$defs/properties/required）"
-            "但没有实际字段值。原因通常是 prompt 里的 {schema} 让模型"
-            "以为要补全 schema 而不是按 schema 产出数据。请删除对应 "
-            "responses/<step_id>.response.json 文件后重跑 step 让 Doubao 重新生成。"
-        )
-    out: dict = {}
-    for k, meta in props.items():
-        if not isinstance(meta, dict):
-            continue
-        if "value" in meta:
-            out[k] = meta["value"]
-        elif "default" in meta:
-            out[k] = meta["default"]
-    return out
+    if has_real_data:
+        # Shape C：直接把 properties 当作数据 dict
+        return props
+
+    # Shape B：props 全是 schema 定义，无数据
+    raise ValueError(
+        "Doubao 返回了纯 JSON Schema 壳（$defs/properties/required）"
+        "但没有实际字段值。原因通常是 prompt 里的 {schema} 让模型"
+        "以为要补全 schema 而不是按 schema 产出数据。请删除对应 "
+        "responses/<step_id>.response.json 文件后重跑 step 让 Doubao 重新生成。"
+    )
 
 
 def _coerce_dict(data, expected_index: int | None) -> dict:

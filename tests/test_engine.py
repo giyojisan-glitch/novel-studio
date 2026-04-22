@@ -344,6 +344,57 @@ class TestBugASchemaEnvelope:
         with pytest.raises(ValueError):
             _coerce_dict(shape_b, expected_index=None)
 
+    # ---------- Bug A 再扩展：Shape C（V5 bible_update 观察到的混合数据壳） ----------
+
+    def test_shape_c_real_data_in_properties_detected(self):
+        """Shape C：顶层 schema 壳（$defs / required），但 properties 值已经是真实数据
+        （scalar / list / 带数据 key 的 dict），不是 schema 定义。"""
+        shape_c = {
+            "$defs": {"CharacterState": {"type": "object"}},
+            "properties": {
+                "chapter_index": 2,
+                "new_characters": [{"name": "沈清", "traits": ["棋艺高超"]}],
+                "timeline_additions": ["沈清赢下第二轮"],
+            },
+            "required": ["chapter_index"],
+            "title": "BibleUpdate",
+            "type": "object",
+        }
+        assert _looks_like_schema_envelope(shape_c) is True
+
+    def test_shape_c_unwrap_returns_properties_as_data(self):
+        """Shape C 剥壳后应直接返回 properties 作为数据 dict（不走 Shape A 的 value 提取）。"""
+        shape_c = {
+            "$defs": {},
+            "properties": {
+                "chapter_index": 2,
+                "new_characters": [{"name": "沈清", "traits": ["棋艺高超"]}],
+            },
+            "required": ["chapter_index"],
+        }
+        out = _unwrap_schema_envelope(shape_c)
+        assert out == {
+            "chapter_index": 2,
+            "new_characters": [{"name": "沈清", "traits": ["棋艺高超"]}],
+        }
+
+    def test_shape_c_coerce_dict_unwraps_real_data(self):
+        """_coerce_dict 对 Shape C 正确剥壳并返回真实数据。"""
+        shape_c = {
+            "$defs": {},
+            "properties": {
+                "chapter_index": 3,
+                "new_facts": [
+                    {"category": "item", "content": "染血裂纹棋盘", "ch_introduced": 3}
+                ],
+            },
+            "required": ["chapter_index"],
+            "type": "object",
+        }
+        out = _coerce_dict(shape_c, expected_index=None)
+        assert out["chapter_index"] == 3
+        assert out["new_facts"][0]["content"] == "染血裂纹棋盘"
+
 
 class TestBugBFinalAuditBounceCap:
     """Bug B 修复：final_audit 反复 bounce-back 会死循环（LLM 给相同 retry_hint）。
