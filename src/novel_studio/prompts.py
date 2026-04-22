@@ -51,6 +51,15 @@ L1_TASK = """## 任务
 7. **V5 必填** `tracked_object_names`（2-5 个）：正文里会反复出现且状态会变化的**关键物件名**
    - 如「三碗酒」「半块木牌」「泥塑土地公」
    - 不包含一次性道具（鞋、书箱）或通用元素（雨、风）
+8. **V6 必填** `plot_promises`（3-5 条）：premise 里的**叙事承诺 / 情节机巧**（非视觉，视觉已在 visual_anchors）
+   - 这是 premise 暗示但需要在正文中**以情节方式兑现**的专业机巧，不是画面
+   - 正例（围棋题材）：「沈清埋下三颗跨越十年的死子，决赛时引爆」「顾衍之的棋路暴露沈家独门棋招的破绽」
+   - 正例（悬疑题材）：「凶手的真身与被害者第一次见面时已暗示」「时间线有一处断裂」
+   - 反例：「主角复仇」「反派被击败」（这是结局，不是机巧）
+   - 每条 `id` 用 `fs_1`/`fs_2`/... 稳定编号；`content` ≤50 字；`setup_ch`/`payoff_ch` 留 0（由 L2 分配）
+   - **若 premise 出现专业术语（"死子"/"暗桩"/"内线"/"断语"），必须有对应 promise**
+9. **V6 必填** 主角（及反派）的 `faction` 字段：所属阵营，如「沈家」/「顾府」/「官方」/「中立」
+   - 解决多股势力角色身份混淆问题；空字符串仅用于纯主角型 premise（如无对抗阵营的独行）
 
 ## 输出
 严格 JSON，符合以下 schema：
@@ -312,7 +321,7 @@ def l2_prompt(state: NovelState, chapter_idx: int) -> str:
     retry = _retry_hint(state, f"L2_{chapter_idx}")
     # V3/V4: 如果启用了 bible，把跨章真相账本注入
     pv = state.user_input.pipeline_version
-    use_bible = pv in ("v3", "v4")
+    use_bible = pv in ("v3", "v4", "v5", "v6")
     bible_block = _bible_context_block(state.world_bible, "L2") if use_bible else ""
     final_audit_block = _final_audit_retry_block(state)
 
@@ -523,8 +532,16 @@ def _v3_active(state: NovelState) -> bool:
 
 
 def _v5_active(state: NovelState) -> bool:
-    """V5 激活：prompt 要加视觉锚点/time_marker/tracked_objects/character status 注入块。"""
-    return state.user_input.pipeline_version == "v5"
+    """V5 激活：prompt 要加视觉锚点/time_marker/tracked_objects/character status 注入块。
+
+    V6 也激活 V5 的所有机制（V6 是正交增量，不替换 V5）。
+    """
+    return state.user_input.pipeline_version in ("v5", "v6")
+
+
+def _v6_active(state: NovelState) -> bool:
+    """V6 激活：prompt 要加 plot_promises / faction / technical_setup/payoff 注入块。"""
+    return state.user_input.pipeline_version == "v6"
 
 
 # ============ V5 辅助函数 · 多个 prompt 共用 ============
@@ -592,6 +609,107 @@ def _unfulfilled_anchors_block(state: NovelState) -> str:
         "（不是概括，而是具体写出来）。若本场剧情正合适兑现，请**写出来**；"
         "若不合适，留给后面章节——但**禁止整本书都不兑现**。"
     )
+    return "\n".join(lines)
+
+
+# ============ V6 辅助函数 · plot_promises / faction / technical_setup/payoff ============
+
+
+def _render_plot_promises_block(state: NovelState) -> str:
+    """V6 L3 通用：渲染 bible.plot_promises 当前账本状态。"""
+    wb = state.world_bible
+    if wb is None or not wb.plot_promises:
+        return ""
+    lines = ["\n\n## 📜 V6 叙事承诺账本（整本书的情节机巧 · 不可漏引爆）"]
+    for p in wb.plot_promises:
+        setup_tag = f"setup@ch{p.setup_ch}" if p.setup_ch > 0 else "未埋"
+        payoff_tag = (
+            f"payoff@ch{p.payoff_ch}✓" if p.fulfilled
+            else (f"计划 payoff@ch{p.payoff_ch}" if p.payoff_ch > 0 else "未兑现")
+        )
+        lines.append(f"- **{p.id}**：{p.content}  [{setup_tag} / {payoff_tag}]")
+    lines.append(
+        "> **铁律**：若本章分配了某个 promise 的 setup，正文里必须**具体写出**埋设行为；"
+        "若分配了 payoff，正文里必须**具体引爆**（用体裁专业术语，不是「真气喷血」式的模糊动作）。"
+    )
+    return "\n".join(lines)
+
+
+def _chapter_promise_assignments_block(state: NovelState, chapter_idx: int) -> str:
+    """V6 L3 专用：本章被 L2 分配了哪些 promise setup/payoff。"""
+    l2 = next((o for o in state.l2 if o.index == chapter_idx), None)
+    if l2 is None:
+        return ""
+    setups = list(getattr(l2, "promise_setups", []))
+    payoffs = list(getattr(l2, "promise_payoffs", []))
+    if not setups and not payoffs:
+        return ""
+    wb = state.world_bible
+    lookup = {p.id: p.content for p in (wb.plot_promises if wb else [])}
+    lines = [f"\n\n## 🎯 V6 本章（ch{chapter_idx}）分配到的叙事承诺"]
+    if setups:
+        lines.append("### 需要本章 setup（埋设）：")
+        for pid in setups:
+            lines.append(f"- **{pid}**：{lookup.get(pid, '(未知 id)')}")
+    if payoffs:
+        lines.append("### 需要本章 payoff（引爆）：")
+        for pid in payoffs:
+            lines.append(f"- **{pid}**：{lookup.get(pid, '(未知 id)')}")
+    lines.append(
+        "> 正文**必须具体兑现**这些机巧，不是「大意是这样」式的概括。"
+        "若是围棋题材必须写出具体**棋位/招法**，若是悬疑题材必须留下具体**线索实体**。"
+    )
+    return "\n".join(lines)
+
+
+def _character_faction_block(state: NovelState) -> str:
+    """V6 L3 专用：渲染带阵营标签的角色列表（同名不同阵营矛盾示警）。"""
+    wb = state.world_bible
+    if wb is None:
+        return ""
+    tagged = [c for c in wb.characters if c.faction]
+    if not tagged:
+        return ""
+    lines = ["\n\n## 🏴 V6 角色阵营图谱（正文描写同名角色时**禁止**改阵营）"]
+    by_faction: dict[str, list[str]] = {}
+    for c in tagged:
+        by_faction.setdefault(c.faction, []).append(c.name)
+    for fac, names in by_faction.items():
+        lines.append(f"- **{fac}**：{'、'.join(names)}")
+    lines.append(
+        "> 若本场出现「暗桩」「内线」「下属」等多方共用词汇，**必须**通过服色/标记/阵营名显式区分"
+        "（如「玄色劲装的沈家暗桩」vs「灰衣顾府眼线」）。"
+    )
+    return "\n".join(lines)
+
+
+def _scene_technical_block(scene_outline) -> str:
+    """V6 L3 专用：渲染本场的 technical_setup/payoff（体裁技术性铺垫）。"""
+    ts = getattr(scene_outline, "technical_setup", "") or ""
+    tp = getattr(scene_outline, "technical_payoff", "") or ""
+    if not ts and not tp:
+        return ""
+    lines = ["\n\n## 🔧 V6 本场技术性伏笔（体裁专业术语硬约束）"]
+    if ts:
+        lines.append(f"- **setup**：{ts}")
+        lines.append("  → 正文必须**具体写出**这个铺垫动作（用体裁术语，不是「真气/金光/喷血」式的模糊描写）")
+    if tp:
+        lines.append(f"- **payoff**：{tp}")
+        lines.append("  → 正文必须**具体引爆**这个铺垫，并**回指 setup 章节**（而不是凭空出现结果）")
+    return "\n".join(lines)
+
+
+def _unfulfilled_promises_block(state: NovelState) -> str:
+    """V6 final_audit 专用：列出整本书未兑现的 plot_promises。"""
+    wb = state.world_bible
+    if wb is None or not wb.plot_promises:
+        return ""
+    unfulfilled = [p for p in wb.plot_promises if not p.fulfilled]
+    if not unfulfilled:
+        return "✓ 所有叙事承诺均已兑现。"
+    lines = ["⚠️ 以下 plot_promises 整本书未兑现（必须在 `unfulfilled_promises` 字段列出）："]
+    for p in unfulfilled:
+        lines.append(f"- {p.id}: {p.content}")
     return "\n".join(lines)
 
 
@@ -959,6 +1077,18 @@ BIBLE_UPDATE_TASK = """## 任务
     - 例：bible 有"父亲化作泥塑上的裂纹"；正文正好写了这个画面 → 填进这里
     - 若本章未兑现任何 anchor，留空数组
 
+### V6 必填增量字段（**若本章有 plot_promise 进展，不得留空**）
+
+12. `promise_setups_done`：本章**真正埋设**了哪些 plot_promise（用 bible 里的 id）
+    - 判断标准：正文里具体写出了**埋设动作**（不是暗示、不是概括）
+    - 围棋例：若正文出现"白72手在左下角留下看似失误的死子"→ 填 ["fs_1"]
+    - 若本章没埋任何承诺，留空数组
+
+13. `promise_payoffs_done`：本章**真正引爆**了哪些 plot_promise（用 bible 里的 id）
+    - 判断标准：正文里具体写出了**引爆动作**并回指 setup（不是模糊的"一击毙命"）
+    - 围棋例：若正文出现"沈清激活第 1 章的死子，破了顾衍之的劫"→ 填 ["fs_1"]
+    - 若本章没兑现任何承诺，留空数组
+
 ## 输出
 严格 JSON：
 
@@ -1086,7 +1216,33 @@ def final_audit_prompt(state: NovelState, full_markdown: str, slop_avg: float) -
                 "5. 若全部兑现，`unfulfilled_anchors=[]`，按原有逻辑判整体 usable\n"
             )
 
-    return FINAL_AUDIT_SYSTEM + v5_block + "\n\n" + FINAL_AUDIT_TASK.format(
+    # V6: 叙事承诺强制检查块
+    v6_block = ""
+    if _v6_active(state) and state.world_bible is not None:
+        wb = state.world_bible
+        if wb.plot_promises:
+            unfulfilled_p = [p for p in wb.plot_promises if not p.fulfilled]
+            v6_block = (
+                "\n\n## 📜 V6 · Plot Promises 强制检查（premise 叙事承诺 / 情节机巧）\n\n"
+                "**L1 产出的 plot_promises 清单**：\n"
+                + "\n".join(f"- {p.id}: {p.content}" for p in wb.plot_promises)
+                + "\n\n**bible 已标记 fulfilled**：\n"
+                + ("\n".join(f"- {p.id}: {p.content}" for p in wb.plot_promises if p.fulfilled)
+                   if any(p.fulfilled for p in wb.plot_promises) else "- （无）")
+                + "\n\n**尚未兑现的承诺**（按理应该在正文里具体引爆）：\n"
+                + ("\n".join(f"- {p.id}: {p.content}" for p in unfulfilled_p) if unfulfilled_p else "- （全部已兑现）")
+                + "\n\n### 检查法\n"
+                "1. 通读 full_markdown，对每条 promise 做识别：正文是否**具体用体裁专业术语**写出了"
+                "承诺的机巧？（如围棋的「死子/官子/手筋」、悬疑的「不在场证明/物证链」）\n"
+                "2. 只写「一招毙命」「突然醒悟」「真气喷血」式的模糊动作**不算兑现**——必须是**具体技术性描写**\n"
+                "3. 把未兑现的 promise（bible 标了 fulfilled 但正文是模糊描写 / bible 标了未兑现）"
+                "填进 `unfulfilled_promises` 字段\n"
+                "4. **若 `unfulfilled_promises` 非空**，必须 `usable=False, suspect_layer=L3, retry_hint` 里"
+                "明确提到缺失的 promise id 和内容\n"
+                "5. 若全部兑现，`unfulfilled_promises=[]`\n"
+            )
+
+    return FINAL_AUDIT_SYSTEM + v5_block + v6_block + "\n\n" + FINAL_AUDIT_TASK.format(
         premise=ui.premise,
         genre=ui.genre,
         total_target=total_target,
@@ -1373,9 +1529,11 @@ L25_TASK = """## 任务
 
 {v5_time_markers_block}
 
+{v6_technical_block}
+
 ## 要求
 - `chapter_index` = {chapter_idx}
-- `scenes`：列表长度 3-5；每个 SceneOutline 含 index（1-based）/ purpose / opening_beat / closing_beat / dominant_motifs / pov / approximate_words{v5_scene_marker_req}
+- `scenes`：列表长度 3-5；每个 SceneOutline 含 index（1-based）/ purpose / opening_beat / closing_beat / dominant_motifs / pov / approximate_words{v5_scene_marker_req}{v6_scene_tech_req}
 - `transition_notes`：列出 N-1 条跨场景转场逻辑（每条 ≤30 字，如"场景 2→3 用三枚铜钱的触感过渡"）
 - 字数分配：所有场景 approximate_words 之和 ≈ {target_words}，最后一场景略长可放结尾
 
@@ -1404,6 +1562,28 @@ V5_L25_TIME_MARKERS_BLOCK = """## ⏳ V5 · 全局时间轴锚点（跨章单调
 
 
 V5_SCENE_MARKER_REQ = "；**必填 V5: `time_marker`**（从上面的全局时间轴选一个未用过的、且严格晚于前面章节已用的）"
+
+
+V6_L25_TECHNICAL_BLOCK = """## 🔧 V6 · 技术性伏笔（Technical Setup / Payoff）
+
+本书的叙事承诺账本（从 L1 产出，L2 已分配到章节）：
+{plot_promises_rendered}
+
+本章被 L2 分配到的 promise：
+- setup: {chapter_setups}
+- payoff: {chapter_payoffs}
+
+## 场景级技术性伏笔约束
+- 若本章被分配了某个 promise setup，**必须**把它落到某个具体 scene 的 `technical_setup` 字段（用体裁专业术语写清楚具体铺垫动作）
+  - 围棋例：`technical_setup="白72手在左下角留下看似失误的死子（fs_1）"`
+  - 悬疑例：`technical_setup="警局档案柜顶层留下贴着红点的文件夹（fs_2）"`
+- 若本章被分配了 payoff，**必须**落到某个 scene 的 `technical_payoff` 字段，并**回指**对应的 setup 场景
+  - 围棋例：`technical_payoff="激活第 1 章埋下的白72手死子，拔掉顾衍之的中盘"`
+- `technical_setup/payoff` 均允许空字符串，但整章至少要满足 L2 的分配要求
+"""
+
+
+V6_SCENE_TECH_REQ = "；**V6 可选**: `technical_setup` / `technical_payoff`（若本章被分配了 promise 则必填）"
 
 
 L3_SCENE_ANTI_COLD_OPEN = """
@@ -1514,6 +1694,22 @@ CONTINUITY_AUDIT_TASK = """## 任务
    （如 bible 列着"父亲化作泥塑裂纹"而本章正好是父亲离场章），**正文是否真写出来**？
    若合适兑现而未兑现 → 直接扣分。
 
+### V6 新增检查项（叙事承诺 + 阵营 + 技术性伏笔）
+
+9. **plot_promises 兑现**：bible.plot_promises 里若本章被分配了 setup 或 payoff（见 L2 的 promise_setups/payoffs），
+   正文**是否具体实现**？（不是概括，是用体裁术语写出具体动作）
+   - 围棋题材：setup"白72手死子"是否真出现了具体**棋位**和**招法**？
+   - 悬疑题材：payoff"指认凶手"是否真给了具体**物证**和**逻辑链**？
+   - 若 L2 分配的 promise 在正文中找不到具体落地 → 直接扣分。
+
+10. **角色阵营一致**：bible.characters 里每个有 `faction` 的角色，本章正文描写时
+    **是否与其阵营一致**？（同名角色不得改阵营；多股势力的模糊称谓如"暗桩""内线"必须通过服色/标记显式区分）
+    - 反例：第 1 章"灰衣暗桩"是顾府，第 3 章又出现"灰衣暗桩"帮助主角 → 阵营矛盾。
+
+11. **technical_setup/payoff 具体性**：本章 scene_outline 里若有 technical_setup/payoff，
+    正文是否**真用体裁专业术语**写出来？（禁止用"真气/金光/喷血/气浪"等武侠万能模糊词替代
+    本应是"棋理/死活/官子/手筋"等围棋专业术语）。
+
 ## 输出
 严格 JSON：
 
@@ -1562,6 +1758,27 @@ def l25_prompt(state: NovelState, chapter_idx: int) -> str:
         v5_markers_block = ""
         v5_scene_marker_req = ""
 
+    # V6: 技术性伏笔要求块
+    if _v6_active(state):
+        wb = state.world_bible
+        if wb and wb.plot_promises:
+            promises_lines = "\n".join(
+                f"- {p.id}: {p.content}" for p in wb.plot_promises
+            )
+        else:
+            promises_lines = "（无 plot_promises）"
+        chapter_setups = "、".join(getattr(l2, "promise_setups", [])) or "（无）"
+        chapter_payoffs = "、".join(getattr(l2, "promise_payoffs", [])) or "（无）"
+        v6_technical_block = V6_L25_TECHNICAL_BLOCK.format(
+            plot_promises_rendered=promises_lines,
+            chapter_setups=chapter_setups,
+            chapter_payoffs=chapter_payoffs,
+        )
+        v6_scene_tech_req = V6_SCENE_TECH_REQ
+    else:
+        v6_technical_block = ""
+        v6_scene_tech_req = ""
+
     return (
         _CREATIVITY_HEADER.get(ui.creativity, "")
         + _lang_meta_header(ui.language)
@@ -1579,6 +1796,8 @@ def l25_prompt(state: NovelState, chapter_idx: int) -> str:
             schema=schema_of(ChapterSceneList),
             v5_time_markers_block=v5_markers_block,
             v5_scene_marker_req=v5_scene_marker_req,
+            v6_technical_block=v6_technical_block,
+            v6_scene_tech_req=v6_scene_tech_req,
         )
         + (f"\n\n## 上轮审稿反馈（请针对性修正）\n{retry}" if retry else "")
         + _final_audit_retry_block(state)
@@ -1602,7 +1821,7 @@ def l3_scene_prompt(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
     multi_scale = _scene_multi_scale_context(state, chapter_idx, scene_idx)
     scene_card = _scene_card_block(state, chapter_idx, scene_idx)
     pv = state.user_input.pipeline_version
-    bible_block = _bible_context_block(state.world_bible, "L3") if pv in ("v3", "v4", "v5") else ""
+    bible_block = _bible_context_block(state.world_bible, "L3") if pv in ("v3", "v4", "v5", "v6") else ""
     retry = _retry_hint(state, f"L3_{chapter_idx}_{scene_idx}")
     final_audit_block = _final_audit_retry_block(state)
 
@@ -1624,11 +1843,22 @@ def l3_scene_prompt(state: NovelState, chapter_idx: int, scene_idx: int) -> str:
             + _unfulfilled_anchors_block(state)
         )
 
+    # V6: 叙事承诺账本 + 本章分配 + 阵营图谱 + 本场技术性伏笔
+    v6_blocks = ""
+    if _v6_active(state):
+        v6_blocks = (
+            _render_plot_promises_block(state)
+            + _chapter_promise_assignments_block(state, chapter_idx)
+            + _character_faction_block(state)
+            + _scene_technical_block(outline)
+        )
+
     return (
         l3_system_for(state.user_input.genre, state.user_input.language, state.user_input.creativity)
         + inspiration_block
         + bible_block
         + v5_blocks
+        + v6_blocks
         + final_audit_block
         + "\n\n"
         + L3_SCENE_TASK.format(

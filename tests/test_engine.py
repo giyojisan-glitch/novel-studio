@@ -955,6 +955,89 @@ class TestV6FinalAuditEnforcement:
         assert "fs_3 死子未引爆" in state.final_verdict.retry_hint
 
 
+class TestV6PromptContent:
+    """V6 prompt 渲染包含新注入块（plot_promises / faction / technical_setup/payoff /
+    unfulfilled_promises）。"""
+
+    def _v6_state(self):
+        from novel_studio.state import PlotPromise
+        s = _make_state("v6", chapters=3)
+        s.l1.visual_anchors = ["A 视觉"]
+        s.l1.tracked_object_names = ["棋盘"]
+        s.l1.plot_promises = [
+            PlotPromise(id="fs_1", content="埋下跨越十年的死子"),
+            PlotPromise(id="fs_2", content="揭露构陷证据"),
+        ]
+        s.l1.protagonist.faction = "沈家"
+        if s.l1.antagonist:
+            s.l1.antagonist.faction = "顾府"
+        s.world_bible = P.build_initial_bible(s.l1)
+        return s
+
+    def test_l1_prompt_requires_plot_promises(self):
+        s = self._v6_state()
+        prompt = P.l1_prompt(s)
+        assert "plot_promises" in prompt
+        assert "faction" in prompt
+        assert "死子" in prompt or "跨越十年的" in prompt
+
+    def test_l3_scene_prompt_injects_v6_blocks(self):
+        from novel_studio.state import L2ChapterOutline, SceneOutline, ChapterSceneList
+        s = self._v6_state()
+        s.l2.append(L2ChapterOutline(
+            index=1, title="c1", summary="s", hook="h", pov="p",
+            key_events=["e"], prev_connection="pc",
+            promise_setups=["fs_1"], promise_payoffs=[],
+        ))
+        so = SceneOutline(index=1, purpose="p", opening_beat="o", closing_beat="c",
+                          approximate_words=300, time_marker="某时",
+                          technical_setup="白72手留下死子")
+        s.scene_lists.append(ChapterSceneList(chapter_index=1, scenes=[so]))
+        import os
+        os.environ["NOVEL_STUDIO_NO_RAG"] = "1"
+        try:
+            prompt = P.l3_scene_prompt(s, chapter_idx=1, scene_idx=1)
+        finally:
+            os.environ.pop("NOVEL_STUDIO_NO_RAG", None)
+        # plot_promises 账本
+        assert "叙事承诺账本" in prompt
+        assert "fs_1" in prompt and "埋下跨越十年的死子" in prompt
+        # 本章分配
+        assert "本章（ch1）分配到的叙事承诺" in prompt
+        assert "需要本章 setup" in prompt
+        # 阵营图谱
+        assert "阵营图谱" in prompt
+        assert "沈家" in prompt and "顾府" in prompt
+        # 技术性伏笔
+        assert "技术性伏笔" in prompt
+        assert "白72手留下死子" in prompt
+
+    def test_l25_prompt_has_v6_technical_block(self):
+        from novel_studio.state import L2ChapterOutline
+        s = self._v6_state()
+        s.l2.append(L2ChapterOutline(
+            index=1, title="c1", summary="s", hook="h", pov="p",
+            key_events=["e"], prev_connection="pc",
+            promise_setups=["fs_1"],
+        ))
+        prompt = P.l25_prompt(s, chapter_idx=1)
+        assert "技术性伏笔" in prompt or "Technical Setup" in prompt
+        assert "fs_1" in prompt
+        assert "technical_setup" in prompt
+
+    def test_final_audit_prompt_has_v6_promise_check(self):
+        s = self._v6_state()
+        # 必须要有 L3 正文否则 final_audit 会爆
+        from novel_studio.state import L3ChapterDraft
+        for i in range(1, 4):
+            s.l3.append(L3ChapterDraft(index=i, content="第 %d 章正文" % i,
+                                        word_count=100))
+        prompt = P.final_audit_prompt(s, "全书 markdown", slop_avg=1.0)
+        assert "Plot Promises 强制检查" in prompt
+        assert "fs_1" in prompt
+        assert "unfulfilled_promises" in prompt
+
+
 class TestV6PipelineSmoke:
     """StubProvider 跑 V6 pipeline · 验证 V6 字段流转。"""
 
